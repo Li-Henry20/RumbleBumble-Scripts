@@ -1,2 +1,2 @@
-# RumbleBumble-Scrips
+# RumbleBumble-Scripts
 Cyberpatriots. Lock in
