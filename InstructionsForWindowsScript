@@ -1,0 +1,10 @@
+Steps to use the script: 
+Open Notepad on the computer. 
+Copy and paste the script in the notepad. 
+Save the file on desktop as CP-Hardening.ps1. 
+Open powershell as administrator. 
+Copy the path for the file in file explorer. 
+Type cd (Path for the file) to open the file directory.
+Then open the file using this command: .\CP-Hardening.ps1. 
+Then use the script :). 
+Btw I did not use Ai to make this part. 

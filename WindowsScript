@@ -1,0 +1,210 @@
+# CyberPatriot Windows Hardening Toolkit 
+
+$report = @()
+$reportFile = ".\CyberPatriot_Hardening_Report.txt"
+
+function Log-Change($message) {
+    $report += $message
+    Write-Host "[+] $message"
+}
+
+# ===============================
+#  FIREWALL
+# ===============================
+function Enable-Firewall {
+    Set-NetFirewallProfile -Profile Domain,Public,Private -Enabled True
+    Log-Change "Firewall enabled for Domain, Public, and Private"
+}
+
+# ===============================
+# WINDOWS SECURITY / DEFENDER
+# ===============================
+function Enable-WinSecurity {
+    Set-MpPreference -DisableRealtimeMonitoring $false
+    Set-MpPreference -DisableIOAVProtection $false
+    Set-MpPreference -DisableBehaviorMonitoring $false
+    Set-MpPreference -EnableControlledFolderAccess Enabled
+
+    Set-ItemProperty "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer" -Name SmartScreenEnabled -Value "RequireAdmin"
+
+    Log-Change "Windows Defender & SmartScreen enabled"
+}
+
+function Defender-Scan {
+    Start-MpScan -ScanType QuickScan
+    Log-Change "Windows Defender Quick Scan started"
+}
+
+# ===============================
+# PASSWORD POLICY
+# ===============================
+function Apply-PasswordPolicy {
+    net accounts /minpwlen:7
+    net accounts /maxpwage:90
+    net accounts /minpwage:1
+    net accounts /uniquepw:5
+    Log-Change "Password policy applied"
+}
+
+# ===============================
+# ACCOUNT LOCKOUT POLICY
+# ===============================
+function Apply-LockoutPolicy {
+    net accounts /lockoutthreshold:5
+    net accounts /lockoutduration:30
+    net accounts /lockoutwindow:30
+    Log-Change "Account lockout applied"
+}
+
+# ===============================
+# AUDIT POLICY
+# ===============================
+function Apply-AuditPolicy {
+    auditpol /set /category:* /success:enable /failure:enable
+    Log-Change "Audit policy enabled for success and failure"
+}
+
+# ===============================
+# USERS & ADMINS
+# ===============================
+function List-UsersAdmins {
+    Get-LocalUser
+    Get-LocalGroupMember -Group Administrators
+}
+
+function Disable-Guest {
+    Disable-LocalUser -Name "Guest" -ErrorAction SilentlyContinue
+    Log-Change "Guest account disabled"
+}
+
+# ===============================
+# SERVICES
+# ===============================
+$ServicesToCheck = @{
+    "RemoteRegistry" = "Stopped,Disabled"
+    "SNMP"           = "Stopped,Disabled"
+    "ftpsvc"         = "Stopped,Disabled"
+    "W3SVC"          = "Stopped,Disabled"
+    "TlntSvr"        = "Stopped,Disabled"
+    "wuauserv"       = "Running,Automatic"
+    "Winmgmt"        = "Running,Automatic"
+    "EventLog"       = "Running,Automatic"
+}
+
+function Set-Services {
+    foreach ($svc in $ServicesToCheck.Keys) {
+        $desired = $ServicesToCheck[$svc].Split(",")
+        $state = $desired[0]
+        $startup = $desired[1]
+
+        $s = Get-Service $svc -ErrorAction SilentlyContinue
+        if ($s) {
+            if ($state -eq "Running") { Start-Service $svc -ErrorAction SilentlyContinue } else { Stop-Service $svc -ErrorAction SilentlyContinue }
+            Set-Service $svc -StartupType $startup
+            Log-Change "$svc set to $state / $startup"
+        }
+    }
+}
+
+# ===============================
+# AUTOPLAY + BLUETOOTH
+# ===============================
+function Disable-AutoPlay {
+    Set-ItemProperty "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\Explorer" -Name NoDriveTypeAutoRun -Value 255
+    Log-Change "AutoPlay disabled"
+}
+
+function Disable-Bluetooth {
+    Stop-Service bthserv -ErrorAction SilentlyContinue
+    Set-Service bthserv -StartupType Disabled
+    Log-Change "Bluetooth disabled"
+}
+
+# ===============================
+# MEDIA SEARCH
+# ===============================
+function Search-Media {
+    Get-ChildItem C:\Users -Include *.mp3,*.mp4,*.wav,*.mov -Recurse -ErrorAction SilentlyContinue |
+        Select FullName | Out-File .\media_found.txt
+    Log-Change "Media search complete"
+}
+
+# ===============================
+# SECURITY POLICIES (NO INF!)
+# ===============================
+function Apply-SecurityPolicies {
+
+    Write-Host "Configuring Security Policies (no INF template)..."
+
+    net accounts /minpwlen:7
+    net accounts /maxpwage:90
+    net accounts /minpwage:1
+    net accounts /uniquepw:5
+
+    net accounts /lockoutthreshold:5
+    net accounts /lockoutduration:30
+    net accounts /lockoutwindow:30
+
+    auditpol /set /category:* /success:enable /failure:enable
+
+    # Deny Guest from logon rights by modifying exported policy — NOT INF
+    secedit /export /cfg tempSec.cfg > $null 2>&1
+
+    (Get-Content tempSec.cfg) `
+        -replace 'SeDenyInteractiveLogonRight =.*', 'SeDenyInteractiveLogonRight = *S-1-5-32-546' `
+        -replace 'SeDenyNetworkLogonRight =.*', 'SeDenyNetworkLogonRight = *S-1-5-32-546' `
+        -replace 'SeDenyRemoteInteractiveLogonRight =.*', 'SeDenyRemoteInteractiveLogonRight = *S-1-5-32-546' |
+        Set-Content tempSec.cfg
+
+    secedit /configure /db secedit.sdb /cfg tempSec.cfg /overwrite > $null 2>&1
+    Remove-Item tempSec.cfg > $null 2>&1
+
+    Log-Change "Security baseline applied (no INF)"
+}
+
+# ===============================
+# MENU
+# ===============================
+function Show-Menu {
+    Clear-Host
+    Write-Host "=== CyberPatriot Hardening Toolkit ==="
+    Write-Host "1. Enable Firewall"
+    Write-Host "2. Enable Windows Security"
+    Write-Host "3. Defender Scan"
+    Write-Host "4. Password Policy"
+    Write-Host "5. Lockout Policy"
+    Write-Host "6. Audit Policy"
+    Write-Host "7. List Users/Admins"
+    Write-Host "8. Disable Guest"
+    Write-Host "9. Fix Services"
+    Write-Host "10. Disable AutoPlay"
+    Write-Host "11. Disable Bluetooth"
+    Write-Host "12. Search Media"
+    Write-Host "13. Apply Security Policies (no INF)"
+    Write-Host "0. Exit"
+}
+
+do {
+    Show-Menu
+    $choice = Read-Host "Option"
+    switch ($choice) {
+        1 {Enable-Firewall}
+        2 {Enable-WinSecurity}
+        3 {Defender-Scan}
+        4 {Apply-PasswordPolicy}
+        5 {Apply-LockoutPolicy}
+        6 {Apply-AuditPolicy}
+        7 {List-UsersAdmins}
+        8 {Disable-Guest}
+        9 {Set-Services}
+        10 {Disable-AutoPlay}
+        11 {Disable-Bluetooth}
+        12 {Search-Media}
+        13 {Apply-SecurityPolicies}
+        0 {break}
+    }
+    pause
+} while ($true)
+
+$report | Out-File $reportFile
+Write-Host "✅ Report saved to $reportFile"
