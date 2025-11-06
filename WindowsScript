@@ -39,11 +39,86 @@ function Defender-Scan {
 # PASSWORD POLICY
 # ===============================
 function Apply-PasswordPolicy {
+    Write-Host "Applying password policy..." -ForegroundColor Yellow
+
+    # Requested parameters:
+    # Enforce password history: 7
+    # Maximum password age: 90 days
+    # Minimum password age: 15 days (chosen; change to 20 if you prefer)
+    # Minimum password length: 7
+    # Password complexity: Enabled
+    # Relax minimum password length limits: Disabled
+    # Store passwords using reversible encryption: Disabled
+
+    # Apply basic net accounts settings
     net accounts /minpwlen:7
     net accounts /maxpwage:90
-    net accounts /minpwage:1
-    net accounts /uniquepw:5
-    Log-Change "Password policy applied"
+    net accounts /minpwage:15
+    net accounts /uniquepw:7
+
+    # Ensure RelaxMinimumPasswordLengthLimits is explicitly set to Disabled (0)
+    # This registry key controls whether MinimumPasswordLength may exceed legacy 14-char limit.
+    reg add "HKLM\SYSTEM\CurrentControlSet\Control\SAM" /v RelaxMinimumPasswordLengthLimits /t REG_DWORD /d 0 /f > $null 2>&1
+
+    # Export local security policy, modify the relevant values, then re-import.
+    secedit /export /cfg tempSec.cfg > $null 2>&1
+
+    $cfg = Get-Content tempSec.cfg -Raw
+
+    if ($cfg -notmatch '\[System Access\]') {
+        $cfg += "`r`n[System Access]`r`n"
+    }
+
+    # Set/replace System Access values to the exact desired settings
+    $cfg = $cfg -replace '(?ms)(?<=\[System Access\].*?)MinimumPasswordAge =.*', "MinimumPasswordAge = 15"
+    if ($cfg -notmatch 'MinimumPasswordAge =') { $cfg = $cfg -replace '(\[System Access\])', "`$1`r`nMinimumPasswordAge = 15" }
+
+    $cfg = $cfg -replace '(?ms)(?<=\[System Access\].*?)MaximumPasswordAge =.*', "MaximumPasswordAge = 90"
+    if ($cfg -notmatch 'MaximumPasswordAge =') { $cfg = $cfg -replace '(\[System Access\])', "`$1`r`nMaximumPasswordAge = 90" }
+
+    $cfg = $cfg -replace '(?ms)(?<=\[System Access\].*?)MinimumPasswordLength =.*', "MinimumPasswordLength = 7"
+    if ($cfg -notmatch 'MinimumPasswordLength =') { $cfg = $cfg -replace '(\[System Access\])', "`$1`r`nMinimumPasswordLength = 7" }
+
+    $cfg = $cfg -replace '(?ms)(?<=\[System Access\].*?)PasswordHistorySize =.*', "PasswordHistorySize = 7"
+    if ($cfg -notmatch 'PasswordHistorySize =') { $cfg = $cfg -replace '(\[System Access\])', "`$1`r`nPasswordHistorySize = 7" }
+
+    # PasswordComplexity = 1 (enabled)
+    $cfg = $cfg -replace '(?ms)(?<=\[System Access\].*?)PasswordComplexity =.*', "PasswordComplexity = 1"
+    if ($cfg -notmatch 'PasswordComplexity =') { $cfg = $cfg -replace '(\[System Access\])', "`$1`r`nPasswordComplexity = 1" }
+
+    # ClearTextPassword = 0 (reversible encryption disabled)
+    $cfg = $cfg -replace '(?ms)(?<=\[System Access\].*?)ClearTextPassword =.*', "ClearTextPassword = 0"
+    if ($cfg -notmatch 'ClearTextPassword =') { $cfg = $cfg -replace '(\[System Access\])', "`$1`r`nClearTextPassword = 0" }
+
+    # Write modified cfg back (use Unicode to match secedit expectations)
+    $cfg | Set-Content tempSec.cfg -Encoding Unicode
+
+    # Import the modified policy
+    secedit /configure /db secedit.sdb /cfg tempSec.cfg /overwrite > $null 2>&1
+
+    # Clean up
+    Remove-Item tempSec.cfg -ErrorAction SilentlyContinue
+
+    Log-Change "Password policy applied: History=7, MaxAge=90, MinAge=15, MinLen=7, Complexity=Enabled, ReversibleEncryption=Disabled, RelaxMinPwdLen=Disabled"
+
+    # === Verification (read-back) ===
+    try {
+        $net = net accounts 2>&1
+        Log-Change "net accounts output:`n$net"
+    } catch { Log-Change "Could not run 'net accounts' for verification: $_" }
+
+    try {
+        # Export current secedit and parse System Access lines for verification
+        secedit /export /cfg verifySec.cfg > $null 2>&1
+        $ver = Get-Content verifySec.cfg -Raw
+        $sys = ($ver -split "`r?`n" | Where-Object { $_ -match '^(MinimumPasswordLength|PasswordHistorySize|MinimumPasswordAge|MaximumPasswordAge|PasswordComplexity|ClearTextPassword)\s*=' })
+        if ($sys) {
+            Log-Change "Secedit (System Access) values:`n$($sys -join "`n")"
+        } else {
+            Log-Change "Unable to parse secedit verification values."
+        }
+        Remove-Item verifySec.cfg -ErrorAction SilentlyContinue
+    } catch { Log-Change "Could not export secedit for verification: $_" }
 }
 
 # ===============================
@@ -107,17 +182,42 @@ function Set-Services {
 }
 
 # ===============================
-# AUTOPLAY + BLUETOOTH
+# AUTOPLAY + BLUETOOTH (FIXED)
 # ===============================
+
 function Disable-AutoPlay {
-    Set-ItemProperty "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\Explorer" -Name NoDriveTypeAutoRun -Value 255
-    Log-Change "AutoPlay disabled"
+    Write-Host "Disabling AutoPlay and AutoRun..." -ForegroundColor Yellow
+
+    # Disable AutoRun for all drives
+    reg add "HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\Explorer" /v NoDriveTypeAutoRun /t REG_DWORD /d 255 /f
+    reg add "HKCU\Software\Microsoft\Windows\CurrentVersion\Policies\Explorer" /v NoDriveTypeAutoRun /t REG_DWORD /d 255 /f
+
+    # Disable AutoPlay through system policy
+    reg add "HKLM\SOFTWARE\Policies\Microsoft\Windows\Explorer" /v NoAutoPlay /t REG_DWORD /d 1 /f
+    reg add "HKLM\SOFTWARE\Policies\Microsoft\Windows\Explorer" /v NoDriveTypeAutoRun /t REG_DWORD /d 255 /f
+
+    Log-Change "AutoPlay and AutoRun fully disabled (system & user level)"
 }
 
 function Disable-Bluetooth {
+    Write-Host "Disabling Bluetooth adapters and services..." -ForegroundColor Yellow
+
+    # Stop and disable Bluetooth Support Service
     Stop-Service bthserv -ErrorAction SilentlyContinue
-    Set-Service bthserv -StartupType Disabled
-    Log-Change "Bluetooth disabled"
+    Set-Service bthserv -StartupType Disabled -ErrorAction SilentlyContinue
+
+    # Disable all Bluetooth PnP devices
+    $btDevices = Get-PnpDevice | Where-Object { $_.Class -eq "Bluetooth" -and $_.Status -eq "OK" }
+    foreach ($device in $btDevices) {
+        Disable-PnpDevice -InstanceId $device.InstanceId -Confirm:$false -ErrorAction SilentlyContinue
+    }
+
+    # Disable Bluetooth in system settings (if available)
+    reg add "HKLM\SYSTEM\CurrentControlSet\Services\BTHPORT\Parameters" /v EnableRadio /t REG_DWORD /d 0 /f
+    reg add "HKLM\SOFTWARE\Microsoft\PolicyManager\default\Bluetooth\AllowBluetooth" /v value /t REG_DWORD /d 0 /f
+    reg add "HKLM\SOFTWARE\Policies\Microsoft\Windows\Bluetooth" /v AllowBluetooth /t REG_DWORD /d 0 /f
+
+    Log-Change "Bluetooth fully disabled (devices, service, and policy)"
 }
 
 # ===============================
@@ -136,10 +236,14 @@ function Apply-SecurityPolicies {
 
     Write-Host "Configuring Security Policies (no INF template)..."
 
+    # Keep these consistent with Apply-PasswordPolicy
     net accounts /minpwlen:7
     net accounts /maxpwage:90
-    net accounts /minpwage:1
-    net accounts /uniquepw:5
+    net accounts /minpwage:15
+    net accounts /uniquepw:7
+
+    # Ensure RelaxMinimumPasswordLengthLimits is explicitly set to Disabled (0)
+    reg add "HKLM\SYSTEM\CurrentControlSet\Control\SAM" /v RelaxMinimumPasswordLengthLimits /t REG_DWORD /d 0 /f > $null 2>&1
 
     net accounts /lockoutthreshold:5
     net accounts /lockoutduration:30
@@ -156,6 +260,18 @@ function Apply-SecurityPolicies {
         -replace 'SeDenyRemoteInteractiveLogonRight =.*', 'SeDenyRemoteInteractiveLogonRight = *S-1-5-32-546' |
         Set-Content tempSec.cfg
 
+    # Also ensure password complexity and reversible encryption settings are enforced here as a safeguard
+    $cfg = Get-Content tempSec.cfg -Raw
+    if ($cfg -notmatch '\[System Access\]') { $cfg += "`r`n[System Access]`r`n" }
+
+    if ($cfg -notmatch 'PasswordComplexity =') { $cfg = $cfg -replace '(\[System Access\])', "`$1`r`nPasswordComplexity = 1" }
+    if ($cfg -notmatch 'ClearTextPassword =') { $cfg = $cfg -replace '(\[System Access\])', "`$1`r`nClearTextPassword = 0" }
+    if ($cfg -notmatch 'PasswordHistorySize =') { $cfg = $cfg -replace '(\[System Access\])', "`$1`r`nPasswordHistorySize = 7" }
+    if ($cfg -notmatch 'MinimumPasswordLength =') { $cfg = $cfg -replace '(\[System Access\])', "`$1`r`nMinimumPasswordLength = 7" }
+    if ($cfg -notmatch 'MinimumPasswordAge =') { $cfg = $cfg -replace '(\[System Access\])', "`$1`r`nMinimumPasswordAge = 15" }
+    if ($cfg -notmatch 'MaximumPasswordAge =') { $cfg = $cfg -replace '(\[System Access\])', "`$1`r`nMaximumPasswordAge = 90" }
+
+    $cfg | Set-Content tempSec.cfg -Encoding Unicode
     secedit /configure /db secedit.sdb /cfg tempSec.cfg /overwrite > $null 2>&1
     Remove-Item tempSec.cfg > $null 2>&1
 
