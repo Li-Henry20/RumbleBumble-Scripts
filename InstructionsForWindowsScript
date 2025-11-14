@@ -1,10 +1,14 @@
 Steps to use the script: 
-Open Notepad on the computer. 
-Copy and paste the script in the notepad. 
-Save the file on desktop as CP-Hardening.ps1. 
-Open powershell as administrator. 
-Copy the path for the file in file explorer. 
-Type cd (Path for the file) to open the file directory.
-Then open the file using this command: .\CP-Hardening.ps1. 
-Then use the script :). 
-Btw I did not use Ai to make this part. 
+
+1. Right-click the WindowsScript file and select "Save As"
+2. Save it with the name: CP-Hardening.ps1 (make sure it has the .ps1 extension)
+3. Right-click on PowerShell and select "Run as Administrator"
+4. Navigate to the folder where you saved the script:
+   cd "C:\Path\To\Your\Script"
+5. If needed, enable script execution (one time only):
+   Set-ExecutionPolicy -ExecutionPolicy RemoteSigned -Scope CurrentUser
+6. Run the script:
+   .\CP-Hardening.ps1
+7. Use the menu to select hardening options
+
+Important: This script must be run as Administrator to work properly! 
