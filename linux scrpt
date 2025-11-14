@@ -401,23 +401,23 @@ main() {
     print_divider()
     log_step "Starting Linux hardening script..."
     print_divider()
-    update_system
-    configure_auto_updates
-    configure_ufw
-    stop_unnecessary_services
-    secure_sshd
-    secure_lightdm
-    install_fail2ban
-    install_clamav
-    install_apparmor
-    enforce_password_policies
-    disable_ipv6
-    print_manual_steps
+    update_system()
+    configure_auto_updates()
+    configure_ufw()
+    stop_unnecessary_services()
+    secure_sshd()
+    secure_lightdm()
+    install_fail2ban()
+    install_clamav()
+    install_apparmor()
+    enforce_password_policies()
+    disable_ipv6()
+    print_manual_steps()
 }
 
-display_warning
-ensure_root
-ensure_apt_available
-detect_distro
-ensure_linux_mint
-main
+display_warning()
+ensure_root()
+ensure_apt_available()
+detect_distro()
+ensure_linux_mint()
+main()
