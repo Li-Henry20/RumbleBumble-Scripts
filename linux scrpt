@@ -175,7 +175,7 @@ update_system() {
     apt-get update
     apt-get upgrade -y
     log_step "   System update complete."
-    print_divider()
+    print_divider
 }
 
 configure_auto_updates() {
@@ -189,7 +189,7 @@ APT::Periodic::AutocleanInterval "7";
 APT::Periodic::Unattended-Upgrade "1";
 EOL
     log_step "   Automatic updates configured."
-    print_divider()
+    print_divider
 }
 
 configure_ufw() {
@@ -198,7 +198,7 @@ configure_ufw() {
     ufw allow ssh >/dev/null 2>&1 || true
     ufw --force enable
     log_step "   UFW installed, SSH allowed, and firewall enabled."
-    print_divider()
+    print_divider
 }
 
 stop_unnecessary_services() {
@@ -207,7 +207,7 @@ stop_unnecessary_services() {
     stop_and_disable_service "yelp.service"
     stop_and_disable_service "apache2"
     log_step "   Services stopped and disabled (ignored if not present)."
-    print_divider()
+    print_divider
 }
 
 secure_sshd() {
@@ -215,7 +215,7 @@ secure_sshd() {
     local ssh_config="/etc/ssh/sshd_config"
     if [[ ! -f "$ssh_config" ]]; then
         warn "sshd_config not found; skipping SSH hardening."
-        print_divider()
+        print_divider
         return
     fi
 
@@ -243,7 +243,7 @@ secure_sshd() {
     echo "    -> Restarting SSH service to apply changes..."
     restart_ssh_service
     log_step "   SSH configuration secured."
-    print_divider()
+    print_divider
 }
 
 secure_lightdm() {
@@ -251,7 +251,7 @@ secure_lightdm() {
     local lightdm_conf="/etc/lightdm/lightdm.conf"
     if [[ ! -d /etc/lightdm && ! -d /usr/share/lightdm ]]; then
         echo "    (Note: LightDM not detected on this system. Skipping.)"
-        print_divider()
+        print_divider
         return
     fi
 
@@ -272,7 +272,7 @@ secure_lightdm() {
     fi
 
     log_step "   LightDM configuration secured."
-    print_divider()
+    print_divider
 }
 
 install_fail2ban() {
@@ -280,7 +280,7 @@ install_fail2ban() {
     apt-get install -y fail2ban
     systemctl enable --now fail2ban
     log_step "   Fail2Ban installed and running."
-    print_divider()
+    print_divider
 }
 
 install_clamav() {
@@ -294,7 +294,7 @@ install_clamav() {
     systemctl enable --now clamav-freshclam
     systemctl enable --now clamav-daemon
     log_step "   ClamAV installed and services enabled."
-    print_divider()
+    print_divider
 }
 
 install_apparmor() {
@@ -302,7 +302,7 @@ install_apparmor() {
     apt-get install -y apparmor-utils
     systemctl enable --now apparmor
     log_step "   AppArmor installed and enabled."
-    print_divider()
+    print_divider
 }
 
 enforce_password_policies() {
@@ -335,7 +335,7 @@ enforce_password_policies() {
     ensure_kv_pair "PASS_WARN_AGE" "7" "$login_defs"
 
     log_step "   Password policies enforced."
-    print_divider()
+    print_divider
 }
 
 disable_ipv6() {
@@ -356,7 +356,7 @@ disable_ipv6() {
     echo "    -> Applying sysctl changes..."
     sysctl -p >/dev/null
     log_step "   IPv6 disabled. A reboot may be required for full effect."
-    print_divider()
+    print_divider
 }
 
 print_manual_steps() {
@@ -398,26 +398,26 @@ EOM
 
 main() {
     log_step "Detected distribution: ${DISTRO_NAME:-unknown} (ID: ${DISTRO_ID:-unknown}, Version: ${DISTRO_VERSION:-unknown})"
-    print_divider()
+    print_divider
     log_step "Starting Linux hardening script..."
-    print_divider()
-    update_system()
-    configure_auto_updates()
-    configure_ufw()
-    stop_unnecessary_services()
-    secure_sshd()
-    secure_lightdm()
-    install_fail2ban()
-    install_clamav()
-    install_apparmor()
-    enforce_password_policies()
-    disable_ipv6()
-    print_manual_steps()
+    print_divider
+    update_system
+    configure_auto_updates
+    configure_ufw
+    stop_unnecessary_services
+    secure_sshd
+    secure_lightdm
+    install_fail2ban
+    install_clamav
+    install_apparmor
+    enforce_password_policies
+    disable_ipv6
+    print_manual_steps
 }
 
-display_warning()
-ensure_root()
-ensure_apt_available()
-detect_distro()
-ensure_linux_mint()
-main()
+display_warning
+ensure_root
+ensure_apt_available
+detect_distro
+ensure_linux_mint
+main
