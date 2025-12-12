@@ -1,0 +1,645 @@
+#!/bin/bash
+set -euo pipefail
+IFS=$'\n\t'
+
+trap 'echo "[!] An unexpected error occurred on line $LINENO. Aborting." >&2' ERR
+
+export DEBIAN_FRONTEND=noninteractive
+
+NEW_SSH_PORT=""
+DISTRO_ID=""
+DISTRO_VERSION=""
+DISTRO_NAME=""
+DISTRO_LIKE=""
+DISTRO_CODENAME=""
+MIN_UBUNTU_BASE_MAJOR=22
+ACTIVE_SERVICE_LOG="/var/log/linux_hardening_active_services.log"
+DEFAULT_SSH_PORT=2222
+DEFAULT_SCREEN_LOCK_TIMEOUT=300
+TARGET_DESKTOP_USER="${SUDO_USER:-}"
+UBUNTU_CODENAME_DETECTED=""
+
+display_warning() {
+cat <<'EOW'
+# Ubuntu Hardening Script
+# Automates the security configuration items from the slide deck.
+# Must be run with root privileges (sudo) on Ubuntu 22.04+ or Linux Mint 21.x (Ubuntu 22.04 base).
+#
+# How to run:
+#   sudo bash "./linux scrpt"
+#
+# WARNING (read before continuing):
+# - SSH will be reconfigured (root login off; port will change after you choose it).
+# - UFW rules, IPv6 settings, and several services will be modified/restarted.
+# - User/group and screen-lock settings may be changed interactively.
+# - Any existing SSH session may drop when sshd restarts. Ensure console access.
+#
+# Press Ctrl+C to abort, or Enter to continue...
+EOW
+read -r
+}
+
+log_step() {
+    echo "[*] $1"
+}
+
+print_divider() {
+    echo "----------------------------------------------------"
+}
+
+warn() {
+    echo "[!] $1" >&2
+}
+
+ensure_root() {
+    if [[ $EUID -ne 0 ]]; then
+        echo "This script must be run as root (e.g., 'sudo bash \"$0\"')." >&2
+        exit 1
+    fi
+}
+
+ensure_apt_available() {
+    if ! command -v apt-get >/dev/null 2>&1; then
+        echo "This script requires apt-get, which is unavailable on this system." >&2
+        exit 1
+    fi
+}
+
+detect_distro() {
+    if [[ -f /etc/os-release ]]; then
+        # shellcheck disable=SC1091
+        . /etc/os-release
+        DISTRO_ID=${ID:-unknown}
+        DISTRO_VERSION=${VERSION_ID:-unknown}
+        DISTRO_NAME=${PRETTY_NAME:-$DISTRO_ID}
+        DISTRO_LIKE=${ID_LIKE:-}
+        DISTRO_CODENAME=${VERSION_CODENAME:-}
+        UBUNTU_CODENAME_DETECTED=${UBUNTU_CODENAME:-}
+    else
+        warn "/etc/os-release not found; proceeding without distro specifics."
+    fi
+}
+
+detect_ubuntu_base_major() {
+    local upstream_file="/etc/upstream-release/lsb-release"
+
+    if [[ -f "$upstream_file" ]]; then
+        # shellcheck disable=SC1091
+        . "$upstream_file"
+        if [[ -n "${DISTRIB_RELEASE:-}" ]]; then
+            echo "${DISTRIB_RELEASE%%.*}"
+            return
+        fi
+    fi
+
+    if [[ -n "$UBUNTU_CODENAME_DETECTED" ]]; then
+        case "$UBUNTU_CODENAME_DETECTED" in
+            noble) echo "24" ; return ;;
+            jammy) echo "22" ; return ;;
+            focal) echo "20" ; return ;;
+            bionic) echo "18" ; return ;;
+        esac
+    fi
+
+    echo ""
+}
+
+ensure_supported_ubuntu() {
+    local base_major=""
+    local base_label="Ubuntu"
+
+    case "$DISTRO_ID" in
+        ubuntu)
+            base_major="${DISTRO_VERSION%%.*}"
+            ;;
+        linuxmint)
+            base_major=$(detect_ubuntu_base_major)
+            base_label="Ubuntu (via Linux Mint base)"
+            if [[ -z "$base_major" ]]; then
+                warn "Unable to determine Ubuntu base version from Linux Mint metadata; falling back to Mint version parsing."
+                base_major="${DISTRO_VERSION%%.*}"
+            fi
+            ;;
+        *)
+            if [[ "$DISTRO_LIKE" == *"ubuntu"* ]]; then
+                warn "Detected $DISTRO_NAME (Ubuntu-based). Proceed carefully; the script is tested on Ubuntu $MIN_UBUNTU_BASE_MAJOR.04+ and Linux Mint 21.x."
+                base_major="${DISTRO_VERSION%%.*}"
+            else
+                echo "This script only supports Ubuntu $MIN_UBUNTU_BASE_MAJOR.04 or newer (including Linux Mint 21.x)." >&2
+                exit 1
+            fi
+            ;;
+    esac
+
+    if [[ -n "$base_major" && "$base_major" =~ ^[0-9]+$ ]]; then
+        if (( base_major < MIN_UBUNTU_BASE_MAJOR )); then
+            echo "Detected $base_label $base_major.xx. Please upgrade to an Ubuntu 22.04 (jammy) base or newer." >&2
+            exit 1
+        fi
+    else
+        warn "Unable to parse base version ('$DISTRO_VERSION'). Proceeding cautiously."
+    fi
+}
+
+backup_file() {
+    local target="$1"
+    if [[ -f "$target" ]]; then
+        local backup="${target}.bak.$(date +%Y%m%d%H%M%S)"
+        cp "$target" "$backup"
+        echo "    (Backup saved to $backup)"
+    fi
+}
+
+ensure_sysctl_value() {
+    local key="$1"
+    local value="$2"
+    local file="$3"
+    touch "$file"
+    if grep -q "^$key" "$file"; then
+        sed -i "s|^$key.*|$key=$value|" "$file"
+    else
+        echo "$key=$value" >> "$file"
+    fi
+}
+
+ensure_kv_pair() {
+    local key="$1"
+    local value="$2"
+    local file="$3"
+    touch "$file"
+    if grep -q "^[#[:space:]]*$key" "$file"; then
+        sed -i -E "s|^[#[:space:]]*$key.*|$key $value|" "$file"
+    else
+        echo "$key $value" >> "$file"
+    fi
+}
+
+stop_and_disable_service() {
+    local svc="$1"
+    systemctl stop "$svc" >/dev/null 2>&1 || true
+    systemctl disable "$svc" >/dev/null 2>&1 || true
+}
+
+restart_ssh_service() {
+    if systemctl list-unit-files | grep -q '^ssh\.service'; then
+        systemctl restart ssh
+    else
+        systemctl restart sshd
+    fi
+}
+
+ensure_package_installed() {
+    local pkg="$1"
+    if ! dpkg -s "$pkg" >/dev/null 2>&1; then
+        apt-get install -y "$pkg"
+    fi
+}
+
+prompt_yes_no() {
+    local prompt="$1"
+    local default_choice="${2:-N}"
+    local input
+    while true; do
+        read -r -p "$prompt " input
+        input=${input:-$default_choice}
+        case "${input^^}" in
+            Y|YES) return 0 ;;
+            N|NO) return 1 ;;
+            *) echo "    Please answer yes or no." ;;
+        esac
+    done
+}
+
+update_system() {
+    log_step "1. Updating package lists and upgrading system..."
+    apt-get update
+    apt-get upgrade -y
+    log_step "   System update complete."
+    print_divider
+}
+
+configure_update_preferences() {
+    log_step "2. Configuring automatic updates and release notifications..."
+    ensure_package_installed "unattended-upgrades"
+    ensure_package_installed "update-notifier-common"
+
+    local distro_id="${DISTRO_ID:-ubuntu}"
+    local distro_codename="${DISTRO_CODENAME:-}"
+    local base_id="$distro_id"
+    local base_codename="$distro_codename"
+
+    if [[ -z "$distro_codename" ]]; then
+        distro_codename=$(lsb_release -sc 2>/dev/null || true)
+        base_codename="$distro_codename"
+    fi
+
+    if [[ "$distro_id" == "linuxmint" ]]; then
+        base_id="Ubuntu"
+        base_codename="${UBUNTU_CODENAME_DETECTED:-$distro_codename}"
+    fi
+
+    if [[ -z "$base_codename" ]]; then
+        warn "Could not determine distro codename; defaulting unattended-upgrades origins to jammy."
+        distro_codename="jammy"
+        base_codename="jammy"
+    fi
+
+    local auto_conf="/etc/apt/apt.conf.d/20auto-upgrades"
+    backup_file "$auto_conf"
+    cat <<'EOL' > "$auto_conf"
+APT::Periodic::Enable "1";
+APT::Periodic::Update-Package-Lists "1";
+APT::Periodic::Download-Upgradeable-Packages "1";
+APT::Periodic::Unattended-Upgrade "1";
+APT::Periodic::AutocleanInterval "7";
+APT::Periodic::Verbose "2";
+EOL
+
+    local unattended_conf="/etc/apt/apt.conf.d/50unattended-upgrades"
+    backup_file "$unattended_conf"
+    local extra_origins=""
+    if [[ "$distro_id" != "$base_id" || "$distro_codename" != "$base_codename" ]]; then
+        extra_origins=$'        "'"${distro_id}:${distro_codename}"'";\n'
+    fi
+
+    cat <<EOL > "$unattended_conf"
+Unattended-Upgrade::Allowed-Origins {
+        "${base_id}:${base_codename}";
+        "${base_id}:${base_codename}-security";
+        "${base_id}:${base_codename}-updates";
+        "${base_id}ESMApps:${base_codename}";
+        "${base_id}ESM:${base_codename}";
+${extra_origins}};
+Unattended-Upgrade::Automatic-Reboot "true";
+Unattended-Upgrade::Automatic-Reboot-Time "02:30";
+Unattended-Upgrade::MinimalSteps "true";
+Unattended-Upgrade::Mail "root";
+Unattended-Upgrade::MailOnlyOnError "true";
+EOL
+
+    local release_conf="/etc/update-manager/release-upgrades"
+    backup_file "$release_conf"
+    if grep -q '^Prompt=' "$release_conf"; then
+        sed -i 's/^Prompt=.*/Prompt=lts/' "$release_conf"
+    else
+        echo 'Prompt=lts' >> "$release_conf"
+    fi
+
+    log_step "   Automatic updates configured for daily security patches and LTS notifications."
+    print_divider
+}
+
+configure_ufw() {
+    log_step "3. Installing and configuring UFW..."
+    ensure_package_installed "ufw"
+    ufw allow ssh >/dev/null 2>&1 || true
+    ufw --force enable
+    echo "    (Optional GUI available via: sudo apt install gufw -y)"
+    log_step "   UFW enabled with SSH temporarily allowed on port 22."
+    print_divider
+}
+
+list_active_services() {
+    log_step "4. Listing active services (saved to $ACTIVE_SERVICE_LOG)..."
+    systemctl list-units --type=service --state=active | tee "$ACTIVE_SERVICE_LOG"
+    log_step "   Review the log file for services to audit further."
+    print_divider
+}
+
+stop_unnecessary_services() {
+    log_step "5. Stopping and disabling common unnecessary services (Nginx, VNC, Apache, Yelp)..."
+    local services=(nginx apache2 vncserver x11vnc tigervncserver vino-server yelp.service)
+    for svc in "${services[@]}"; do
+        stop_and_disable_service "$svc"
+    done
+    log_step "   Target services stopped/disabled when present."
+    print_divider
+}
+
+secure_lightdm() {
+    log_step "6. Hardening LightDM root and guest settings..."
+    if [[ ! -d /etc/lightdm && ! -d /usr/share/lightdm ]]; then
+        echo "    LightDM not detected; skipping display manager hardening."
+        print_divider
+        return
+    fi
+
+    local lightdm_conf="/etc/lightdm/lightdm.conf"
+    mkdir -p /etc/lightdm
+    touch "$lightdm_conf"
+    backup_file "$lightdm_conf"
+
+    if grep -q "^[#[:space:]]*allow-root" "$lightdm_conf"; then
+        sed -i 's|^[#[:space:]]*allow-root.*|allow-root=false|' "$lightdm_conf"
+    else
+        echo "allow-root=false" >> "$lightdm_conf"
+    fi
+
+    local guest_conf="/usr/share/lightdm/lightdm.conf.d/50-ubuntu.conf"
+    mkdir -p "$(dirname "$guest_conf")"
+    touch "$guest_conf"
+    backup_file "$guest_conf"
+
+    if grep -q "^[#[:space:]]*allow-guest" "$guest_conf"; then
+        sed -i 's|^[#[:space:]]*allow-guest.*|allow-guest=false|' "$guest_conf"
+    else
+        echo "allow-guest=false" >> "$guest_conf"
+    fi
+
+    log_step "   Root and guest logins disabled for LightDM."
+    print_divider
+}
+
+prompt_for_ssh_port() {
+    local input=""
+    while true; do
+        read -r -p "    Enter a new SSH port (1024-65535, default $DEFAULT_SSH_PORT): " input
+        input=${input:-$DEFAULT_SSH_PORT}
+        if [[ "$input" =~ ^[0-9]+$ ]] && (( input >= 1024 && input <= 65535 )); then
+            if (( input == 22 )); then
+                echo "    Please choose a port other than 22."
+                continue
+            fi
+            NEW_SSH_PORT="$input"
+            break
+        else
+            echo "    Invalid port. Try again."
+        fi
+    done
+}
+
+secure_sshd() {
+    log_step "7. Securing SSH daemon configuration..."
+    local ssh_config="/etc/ssh/sshd_config"
+    if [[ ! -f "$ssh_config" ]]; then
+        warn "sshd_config missing. Creating a new one."
+        touch "$ssh_config"
+    fi
+    backup_file "$ssh_config"
+
+    if grep -q "^[#[:space:]]*PermitRootLogin" "$ssh_config"; then
+        sed -i 's|^[#[:space:]]*PermitRootLogin.*|PermitRootLogin no|' "$ssh_config"
+    else
+        echo "PermitRootLogin no" >> "$ssh_config"
+    fi
+
+    prompt_for_ssh_port
+
+    if grep -q "^[#[:space:]]*Port " "$ssh_config"; then
+        sed -i "s|^[#[:space:]]*Port .*|Port $NEW_SSH_PORT|" "$ssh_config"
+    else
+        echo "Port $NEW_SSH_PORT" >> "$ssh_config"
+    fi
+
+    if command -v ufw >/dev/null 2>&1; then
+        echo "    -> Updating UFW rules for port $NEW_SSH_PORT..."
+        ufw allow "$NEW_SSH_PORT"/tcp
+        ufw delete allow 22/tcp >/dev/null 2>&1 || true
+        ufw deny 22/tcp >/dev/null 2>&1 || true
+    fi
+
+    echo "    -> Restarting SSH service..."
+    restart_ssh_service
+    log_step "   SSH root login disabled and port set to $NEW_SSH_PORT."
+    print_divider
+}
+
+configure_screen_lock() {
+    log_step "8. Enabling GNOME automatic screen lock..."
+    if ! command -v gsettings >/dev/null 2>&1; then
+        warn "gsettings is unavailable; skipping screen lock automation."
+        print_divider
+        return
+    fi
+
+    local user="$TARGET_DESKTOP_USER"
+    if [[ -z "$user" ]]; then
+        read -r -p "    Enter the desktop username to configure (blank to skip): " user
+    fi
+
+    if [[ -z "$user" ]]; then
+        warn "No desktop user supplied; skipping screen lock configuration."
+        print_divider
+        return
+    fi
+
+    if ! id "$user" >/dev/null 2>&1; then
+        warn "User '$user' not found; skipping screen lock configuration."
+        print_divider
+        return
+    fi
+
+    local uid
+    uid=$(id -u "$user")
+    local bus="/run/user/$uid/bus"
+    if [[ ! -S "$bus" ]]; then
+        warn "DBus session for $user not found at $bus. Log into a graphical session and re-run this section manually."
+        print_divider
+        return
+    fi
+
+    sudo -u "$user" DBUS_SESSION_BUS_ADDRESS="unix:path=$bus" gsettings set org.gnome.desktop.session idle-delay "$DEFAULT_SCREEN_LOCK_TIMEOUT" || warn "Failed to set idle-delay."
+    sudo -u "$user" DBUS_SESSION_BUS_ADDRESS="unix:path=$bus" gsettings set org.gnome.desktop.screensaver lock-enabled true || warn "Failed to enable screen lock."
+    log_step "   Screen lock enabled for $user with timeout ${DEFAULT_SCREEN_LOCK_TIMEOUT}s."
+    print_divider
+}
+
+install_fail2ban() {
+    log_step "9. Installing and enabling Fail2Ban..."
+    ensure_package_installed "fail2ban"
+    systemctl enable --now fail2ban
+    log_step "   Fail2Ban installed, enabled, and running."
+    print_divider
+}
+
+install_clamav() {
+    log_step "10. Installing ClamAV and refreshing definitions..."
+    ensure_package_installed "clamav"
+    ensure_package_installed "clamav-daemon"
+    systemctl stop clamav-freshclam >/dev/null 2>&1 || true
+    if ! freshclam; then
+        warn "FreshClam update failed; try running 'freshclam' later."
+    fi
+    systemctl enable --now clamav-freshclam
+    systemctl enable --now clamav-daemon
+
+    if prompt_yes_no "    Run a full ClamAV scan now? (This may take a long time) [y/N]:" "N"; then
+        clamscan -r / --bell -i || warn "ClamAV scan encountered issues."
+    else
+        echo "    Skipping on-the-spot scan. Run 'clamscan -r /' later."
+    fi
+
+    log_step "   ClamAV ready."
+    print_divider
+}
+
+enforce_password_policies() {
+    log_step "11. Enforcing PAM password quality policies..."
+    ensure_package_installed "libpam-pwquality"
+
+    local pwquality_conf="/etc/pam.d/common-password"
+    local pwquality_line="password requisite pam_pwquality.so retry=3 minlen=12 maxrepeat=3 ucredit=-1 lcredit=-1 dcredit=-1 ocredit=-1 difok=4 reject_username enforce_for_root"
+
+    touch "$pwquality_conf"
+    backup_file "$pwquality_conf"
+
+    if grep -q "pam_pwquality.so" "$pwquality_conf"; then
+        sed -i "s|.*pam_pwquality.so.*|$pwquality_line|" "$pwquality_conf"
+    else
+        echo "$pwquality_line" >> "$pwquality_conf"
+    fi
+
+    local login_defs="/etc/login.defs"
+    touch "$login_defs"
+    backup_file "$login_defs"
+
+    ensure_kv_pair "FAIL_LOG_ENAB" "yes" "$login_defs"
+    ensure_kv_pair "LOG_OK_LOGINS" "yes" "$login_defs"
+    ensure_kv_pair "LOG_UNKFAIL_ENAB" "yes" "$login_defs"
+    ensure_kv_pair "SYSLOG_SU_ENAB" "yes" "$login_defs"
+    ensure_kv_pair "SYSLOG_SG_ENAB" "yes" "$login_defs"
+    ensure_kv_pair "PASS_MAX_DAYS" "90" "$login_defs"
+    ensure_kv_pair "PASS_MIN_DAYS" "15" "$login_defs"
+    ensure_kv_pair "PASS_WARN_AGE" "7" "$login_defs"
+
+    log_step "   Password policy tightened."
+    print_divider
+}
+
+install_apparmor() {
+    log_step "12. Ensuring AppArmor is installed and active..."
+    ensure_package_installed "apparmor"
+    ensure_package_installed "apparmor-utils"
+    systemctl enable --now apparmor
+    systemctl status apparmor --no-pager || true
+    log_step "   AppArmor enabled and status displayed above."
+    print_divider
+}
+
+manage_users() {
+    log_step "13. Reviewing and managing local user accounts..."
+    if [[ -r /etc/shadow ]]; then
+        echo "    Accounts with password hashes set:"
+        awk -F: '($2 != "*" && $2 != "!" && $2 !~ /^!!/) {print "      - "$1}' /etc/shadow
+    else
+        warn "Cannot read /etc/shadow to list passworded accounts."
+    fi
+
+    if prompt_yes_no "    Change a user's password now? [y/N]:" "N"; then
+        read -r -p "    Enter username: " user
+        passwd "$user"
+    fi
+
+    if prompt_yes_no "    Create a new user now? [y/N]:" "N"; then
+        read -r -p "    Enter new username: " new_user
+        adduser "$new_user"
+    fi
+
+    if prompt_yes_no "    Delete an existing user now? [y/N]:" "N"; then
+        read -r -p "    Enter username to delete: " del_user
+        if prompt_yes_no "    Remove home directory as well? [y/N]:" "N"; then
+            deluser --remove-home "$del_user"
+        else
+            deluser "$del_user"
+        fi
+    fi
+
+    log_step "   User account review complete."
+    print_divider
+}
+
+manage_groups() {
+    log_step "14. Reviewing and managing local groups..."
+    echo "    Current groups:"
+    cut -d: -f1 /etc/group | sed 's/^/      - /'
+
+    if prompt_yes_no "    Create a new group? [y/N]:" "N"; then
+        read -r -p "    Enter new group name: " group_name
+        groupadd "$group_name"
+    fi
+
+    if prompt_yes_no "    Add a user to a group? [y/N]:" "N"; then
+        read -r -p "    Username: " user
+        read -r -p "    Group: " grp
+        usermod -aG "$grp" "$user"
+        echo "    Added $user to $grp."
+    fi
+
+    if prompt_yes_no "    Add a user to the sudo group? [y/N]:" "N"; then
+        read -r -p "    Username: " sudo_user
+        usermod -aG sudo "$sudo_user"
+        echo "    Added $sudo_user to sudo."
+    fi
+
+    if prompt_yes_no "    Remove a user from the sudo group? [y/N]:" "N"; then
+        read -r -p "    Username: " drop_user
+        gpasswd -d "$drop_user" sudo || warn "User may not have been in sudo."
+    fi
+
+    log_step "   Group management tasks completed."
+    print_divider
+}
+
+disable_ipv6() {
+    log_step "15. Disabling IPv6 via sysctl..."
+    local sysctl_conf="/etc/sysctl.conf"
+    touch "$sysctl_conf"
+    backup_file "$sysctl_conf"
+
+    if ! grep -q "# Disable IPv6 (linux_hardening)" "$sysctl_conf"; then
+        echo "" >> "$sysctl_conf"
+        echo "# Disable IPv6 (linux_hardening)" >> "$sysctl_conf"
+    fi
+
+    ensure_sysctl_value "net.ipv6.conf.all.disable_ipv6" "1" "$sysctl_conf"
+    ensure_sysctl_value "net.ipv6.conf.default.disable_ipv6" "1" "$sysctl_conf"
+    ensure_sysctl_value "net.ipv6.conf.lo.disable_ipv6" "1" "$sysctl_conf"
+
+    echo "    -> Applying sysctl changes..."
+    sysctl -p >/dev/null
+    log_step "   IPv6 disabled (reboot recommended)."
+    print_divider
+}
+
+print_manual_steps() {
+    cat <<EOM
+====================================================
+SCRIPT EXECUTION FINISHED
+====================================================
+
+Next actions / reminders:
+- Confirm you can connect via SSH on port $NEW_SSH_PORT (old port 22 is now denied).
+- Review $ACTIVE_SERVICE_LOG to audit active services further.
+- If screen-lock automation was skipped, configure it manually via Settings > Privacy > Screen Lock.
+- Schedule recurring ClamAV scans (e.g., 'clamscan -r /home').
+- Verify user/group changes and ensure MFA or other controls as needed.
+EOM
+}
+
+main() {
+    log_step "Detected distribution: ${DISTRO_NAME:-unknown} (ID: ${DISTRO_ID:-unknown}, Version: ${DISTRO_VERSION:-unknown})"
+    print_divider
+    update_system
+    configure_update_preferences
+    configure_ufw
+    list_active_services
+    stop_unnecessary_services
+    secure_lightdm
+    secure_sshd
+    configure_screen_lock
+    install_fail2ban
+    install_clamav
+    enforce_password_policies
+    install_apparmor
+    manage_users
+    manage_groups
+    disable_ipv6
+    print_manual_steps
+}
+
+display_warning
+ensure_root
+ensure_apt_available
+detect_distro
+ensure_supported_ubuntu
+main
