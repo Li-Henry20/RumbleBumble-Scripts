@@ -22,4 +22,5 @@ See `InstructionsForLinuxScript` for the same step-by-step guidance you get on W
 - Reconnect over SSH using the new port displayed at the end of the script.
 - Review the generated backups in `/etc/*.bak.*` if you need to revert any configuration files.
 - Complete the manual checklist printed by the script (user accounts, screen lock, hidden files, and ClamAV scans).
+- Check `/var/log/clamav/manual-scan-*.log` for the results of any antivirus scans kicked off by the script.
 

@@ -12,17 +12,19 @@ DISTRO_VERSION=""
 DISTRO_NAME=""
 DISTRO_LIKE=""
 DISTRO_CODENAME=""
-MIN_UBUNTU_MAJOR=22
+MIN_UBUNTU_BASE_MAJOR=22
 ACTIVE_SERVICE_LOG="/var/log/linux_hardening_active_services.log"
 DEFAULT_SSH_PORT=2222
 DEFAULT_SCREEN_LOCK_TIMEOUT=300
 TARGET_DESKTOP_USER="${SUDO_USER:-}"
+UBUNTU_CODENAME_DETECTED=""
+CLAMAV_SCAN_LOG_DIR="/var/log/clamav"
 
 display_warning() {
 cat <<'EOW'
 # Ubuntu Hardening Script
 # Automates the security configuration items from the slide deck.
-# Must be run with root privileges (sudo) on Ubuntu 22.04+.
+# Must be run with root privileges (sudo) on Ubuntu 22.04+ or Linux Mint 21.x (Ubuntu 22.04 base).
 #
 # How to run:
 #   sudo bash "./linux scrpt"
@@ -73,29 +75,70 @@ detect_distro() {
         DISTRO_NAME=${PRETTY_NAME:-$DISTRO_ID}
         DISTRO_LIKE=${ID_LIKE:-}
         DISTRO_CODENAME=${VERSION_CODENAME:-}
+        UBUNTU_CODENAME_DETECTED=${UBUNTU_CODENAME:-}
     else
         warn "/etc/os-release not found; proceeding without distro specifics."
     fi
 }
 
-ensure_supported_ubuntu() {
-    if [[ "$DISTRO_ID" != "ubuntu" ]]; then
-        if [[ "$DISTRO_LIKE" == *"ubuntu"* ]]; then
-            warn "Detected $DISTRO_NAME (Ubuntu-based). Proceed carefully; the script is tested on Ubuntu $MIN_UBUNTU_MAJOR.04+."
-        else
-            echo "This script only supports Ubuntu $MIN_UBUNTU_MAJOR.04 or newer." >&2
-            exit 1
+detect_ubuntu_base_major() {
+    local upstream_file="/etc/upstream-release/lsb-release"
+
+    if [[ -f "$upstream_file" ]]; then
+        # shellcheck disable=SC1091
+        . "$upstream_file"
+        if [[ -n "${DISTRIB_RELEASE:-}" ]]; then
+            echo "${DISTRIB_RELEASE%%.*}"
+            return
         fi
     fi
 
-    local ubuntu_major="${DISTRO_VERSION%%.*}"
-    if [[ -n "$ubuntu_major" && "$ubuntu_major" =~ ^[0-9]+$ ]]; then
-        if (( ubuntu_major < MIN_UBUNTU_MAJOR )); then
-            echo "Detected Ubuntu $DISTRO_VERSION. Please upgrade to Ubuntu $MIN_UBUNTU_MAJOR.04 or newer." >&2
+    if [[ -n "$UBUNTU_CODENAME_DETECTED" ]]; then
+        case "$UBUNTU_CODENAME_DETECTED" in
+            noble) echo "24" ; return ;;
+            jammy) echo "22" ; return ;;
+            focal) echo "20" ; return ;;
+            bionic) echo "18" ; return ;;
+        esac
+    fi
+
+    echo ""
+}
+
+ensure_supported_ubuntu() {
+    local base_major=""
+    local base_label="Ubuntu"
+
+    case "$DISTRO_ID" in
+        ubuntu)
+            base_major="${DISTRO_VERSION%%.*}"
+            ;;
+        linuxmint)
+            base_major=$(detect_ubuntu_base_major)
+            base_label="Ubuntu (via Linux Mint base)"
+            if [[ -z "$base_major" ]]; then
+                warn "Unable to determine Ubuntu base version from Linux Mint metadata; falling back to Mint version parsing."
+                base_major="${DISTRO_VERSION%%.*}"
+            fi
+            ;;
+        *)
+            if [[ "$DISTRO_LIKE" == *"ubuntu"* ]]; then
+                warn "Detected $DISTRO_NAME (Ubuntu-based). Proceed carefully; the script is tested on Ubuntu $MIN_UBUNTU_BASE_MAJOR.04+ and Linux Mint 21.x."
+                base_major="${DISTRO_VERSION%%.*}"
+            else
+                echo "This script only supports Ubuntu $MIN_UBUNTU_BASE_MAJOR.04 or newer (including Linux Mint 21.x)." >&2
+                exit 1
+            fi
+            ;;
+    esac
+
+    if [[ -n "$base_major" && "$base_major" =~ ^[0-9]+$ ]]; then
+        if (( base_major < MIN_UBUNTU_BASE_MAJOR )); then
+            echo "Detected $base_label $base_major.xx. Please upgrade to an Ubuntu 22.04 (jammy) base or newer." >&2
             exit 1
         fi
     else
-        warn "Unable to parse Ubuntu version ('$DISTRO_VERSION'). Proceeding cautiously."
+        warn "Unable to parse base version ('$DISTRO_VERSION'). Proceeding cautiously."
     fi
 }
 
@@ -183,12 +226,23 @@ configure_update_preferences() {
 
     local distro_id="${DISTRO_ID:-ubuntu}"
     local distro_codename="${DISTRO_CODENAME:-}"
+    local base_id="$distro_id"
+    local base_codename="$distro_codename"
+
     if [[ -z "$distro_codename" ]]; then
         distro_codename=$(lsb_release -sc 2>/dev/null || true)
+        base_codename="$distro_codename"
     fi
-    if [[ -z "$distro_codename" ]]; then
+
+    if [[ "$distro_id" == "linuxmint" ]]; then
+        base_id="Ubuntu"
+        base_codename="${UBUNTU_CODENAME_DETECTED:-$distro_codename}"
+    fi
+
+    if [[ -z "$base_codename" ]]; then
         warn "Could not determine distro codename; defaulting unattended-upgrades origins to jammy."
         distro_codename="jammy"
+        base_codename="jammy"
     fi
 
     local auto_conf="/etc/apt/apt.conf.d/20auto-upgrades"
@@ -204,14 +258,19 @@ EOL
 
     local unattended_conf="/etc/apt/apt.conf.d/50unattended-upgrades"
     backup_file "$unattended_conf"
+    local extra_origins=""
+    if [[ "$distro_id" != "$base_id" || "$distro_codename" != "$base_codename" ]]; then
+        extra_origins=$'        "'"${distro_id}:${distro_codename}"'";\n'
+    fi
+
     cat <<EOL > "$unattended_conf"
 Unattended-Upgrade::Allowed-Origins {
-        "${distro_id}:${distro_codename}";
-        "${distro_id}:${distro_codename}-security";
-        "${distro_id}:${distro_codename}-updates";
-        "${distro_id}ESMApps:${distro_codename}";
-        "${distro_id}ESM:${distro_codename}";
-};
+        "${base_id}:${base_codename}";
+        "${base_id}:${base_codename}-security";
+        "${base_id}:${base_codename}-updates";
+        "${base_id}ESMApps:${base_codename}";
+        "${base_id}ESM:${base_codename}";
+${extra_origins}};
 Unattended-Upgrade::Automatic-Reboot "true";
 Unattended-Upgrade::Automatic-Reboot-Time "02:30";
 Unattended-Upgrade::MinimalSteps "true";
@@ -394,21 +453,67 @@ install_fail2ban() {
     print_divider
 }
 
+run_clamav_scan() {
+    local timestamp log_file scan_status=0
+    timestamp=$(date +%Y%m%d%H%M%S)
+    mkdir -p "$CLAMAV_SCAN_LOG_DIR"
+    log_file="$CLAMAV_SCAN_LOG_DIR/manual-scan-$timestamp.log"
+    echo "    -> Logging scan output to $log_file"
+
+    local -a clamscan_cmd=(
+        clamscan
+        -r
+        --bell
+        -i
+        --log="$log_file"
+        --exclude-dir="^/proc"
+        --exclude-dir="^/sys"
+        --exclude-dir="^/run"
+        --exclude-dir="^/dev"
+        --exclude-dir="^/snap"
+        --exclude-dir="^/var/lib/docker"
+        --exclude-dir="^/var/lib/flatpak"
+        /
+    )
+
+    if ! "${clamscan_cmd[@]}"; then
+        scan_status=$?
+    fi
+
+    case "$scan_status" in
+        0)
+            echo "    -> ClamAV scan finished with no detections."
+            return 0
+            ;;
+        1)
+            warn "ClamAV flagged potential malware; review $log_file for details."
+            return 0
+            ;;
+        *)
+            warn "ClamAV scan failed (exit code $scan_status). See $log_file for more information."
+            return 1
+            ;;
+    esac
+}
+
 install_clamav() {
     log_step "10. Installing ClamAV and refreshing definitions..."
     ensure_package_installed "clamav"
     ensure_package_installed "clamav-daemon"
     systemctl stop clamav-freshclam >/dev/null 2>&1 || true
-    if ! freshclam; then
+    systemctl stop clamav-daemon >/dev/null 2>&1 || true
+    if ! freshclam --quiet; then
         warn "FreshClam update failed; try running 'freshclam' later."
     fi
     systemctl enable --now clamav-freshclam
     systemctl enable --now clamav-daemon
 
     if prompt_yes_no "    Run a full ClamAV scan now? (This may take a long time) [y/N]:" "N"; then
-        clamscan -r / --bell -i || warn "ClamAV scan encountered issues."
+        if ! run_clamav_scan; then
+            warn "Manual scan encountered issues. Re-run with: sudo clamscan -r / --bell -i"
+        fi
     else
-        echo "    Skipping on-the-spot scan. Run 'clamscan -r /' later."
+        echo "    Skipping on-the-spot scan. Run 'sudo clamscan -r / --bell -i' later."
     fi
 
     log_step "   ClamAV ready."
@@ -554,6 +659,7 @@ Next actions / reminders:
 - Review $ACTIVE_SERVICE_LOG to audit active services further.
 - If screen-lock automation was skipped, configure it manually via Settings > Privacy > Screen Lock.
 - Schedule recurring ClamAV scans (e.g., 'clamscan -r /home').
+- Schedule recurring ClamAV scans (e.g., 'sudo clamscan -r /home --bell -i') and review logs saved under $CLAMAV_SCAN_LOG_DIR.
 - Verify user/group changes and ensure MFA or other controls as needed.
 EOM
 }

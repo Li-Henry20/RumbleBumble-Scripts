@@ -18,6 +18,7 @@ DEFAULT_SSH_PORT=2222
 DEFAULT_SCREEN_LOCK_TIMEOUT=300
 TARGET_DESKTOP_USER="${SUDO_USER:-}"
 UBUNTU_CODENAME_DETECTED=""
+CLAMAV_SCAN_LOG_DIR="/var/log/clamav"
 
 display_warning() {
 cat <<'EOW'
@@ -452,21 +453,67 @@ install_fail2ban() {
     print_divider
 }
 
+run_clamav_scan() {
+    local timestamp log_file scan_status=0
+    timestamp=$(date +%Y%m%d%H%M%S)
+    mkdir -p "$CLAMAV_SCAN_LOG_DIR"
+    log_file="$CLAMAV_SCAN_LOG_DIR/manual-scan-$timestamp.log"
+    echo "    -> Logging scan output to $log_file"
+
+    local -a clamscan_cmd=(
+        clamscan
+        -r
+        --bell
+        -i
+        --log="$log_file"
+        --exclude-dir="^/proc"
+        --exclude-dir="^/sys"
+        --exclude-dir="^/run"
+        --exclude-dir="^/dev"
+        --exclude-dir="^/snap"
+        --exclude-dir="^/var/lib/docker"
+        --exclude-dir="^/var/lib/flatpak"
+        /
+    )
+
+    if ! "${clamscan_cmd[@]}"; then
+        scan_status=$?
+    fi
+
+    case "$scan_status" in
+        0)
+            echo "    -> ClamAV scan finished with no detections."
+            return 0
+            ;;
+        1)
+            warn "ClamAV flagged potential malware; review $log_file for details."
+            return 0
+            ;;
+        *)
+            warn "ClamAV scan failed (exit code $scan_status). See $log_file for more information."
+            return 1
+            ;;
+    esac
+}
+
 install_clamav() {
     log_step "10. Installing ClamAV and refreshing definitions..."
     ensure_package_installed "clamav"
     ensure_package_installed "clamav-daemon"
     systemctl stop clamav-freshclam >/dev/null 2>&1 || true
-    if ! freshclam; then
+    systemctl stop clamav-daemon >/dev/null 2>&1 || true
+    if ! freshclam --quiet; then
         warn "FreshClam update failed; try running 'freshclam' later."
     fi
     systemctl enable --now clamav-freshclam
     systemctl enable --now clamav-daemon
 
     if prompt_yes_no "    Run a full ClamAV scan now? (This may take a long time) [y/N]:" "N"; then
-        clamscan -r / --bell -i || warn "ClamAV scan encountered issues."
+        if ! run_clamav_scan; then
+            warn "Manual scan encountered issues. Re-run with: sudo clamscan -r / --bell -i"
+        fi
     else
-        echo "    Skipping on-the-spot scan. Run 'clamscan -r /' later."
+        echo "    Skipping on-the-spot scan. Run 'sudo clamscan -r / --bell -i' later."
     fi
 
     log_step "   ClamAV ready."
@@ -612,6 +659,7 @@ Next actions / reminders:
 - Review $ACTIVE_SERVICE_LOG to audit active services further.
 - If screen-lock automation was skipped, configure it manually via Settings > Privacy > Screen Lock.
 - Schedule recurring ClamAV scans (e.g., 'clamscan -r /home').
+- Schedule recurring ClamAV scans (e.g., 'sudo clamscan -r /home --bell -i') and review logs saved under $CLAMAV_SCAN_LOG_DIR.
 - Verify user/group changes and ensure MFA or other controls as needed.
 EOM
 }
