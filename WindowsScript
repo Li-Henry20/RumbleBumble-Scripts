@@ -1,58 +1,502 @@
 #requires -RunAsAdministrator
-param(
-    [switch]$EnableRdp,
-    [switch]$SkipDefenderScan,
-    [switch]$SkipShareCleanup
+
+<#
+.SYNOPSIS
+    CyberPatriot User Account Management Helper
+    
+.DESCRIPTION
+    This script helps you quickly audit and fix user accounts based on the README requirements.
+    It will show you what's wrong and let you fix it step-by-step or all at once.
+    
+.NOTES
+    BEFORE RUNNING: Edit the $README_REQUIREMENTS section below with info from your README!
+#>
+
+# ============================================================================
+# EDIT THIS SECTION BASED ON YOUR README FILE!
+# ============================================================================
+$README_REQUIREMENTS = @{
+    # Users who SHOULD exist and be Administrators
+    RequiredAdmins = @(
+        "Administrator"
+        # Add your admin users here, one per line in quotes with commas
+        # Example: "JohnDoe", "JaneSmith"
+    )
+    
+    # Users who SHOULD exist but be regular Users (not admins)
+    RequiredUsers = @(
+        "Guest"
+        # Add your regular users here, one per line in quotes with commas
+        # Example: "Bob", "Alice", "Charlie"
+    )
+    
+    # Set to $true to enforce password requirements automatically
+    # Set to $false to just check and warn
+    EnforcePasswords = $false
+    
+    # Default password for users without one (only if EnforcePasswords = $true)
+    DefaultPassword = "CyberPatriot1!"
+
+    # Applications that are ALLOWED (even if they appear in the prohibited list)
+    # Common examples: "Google Chrome", "Firefox"
+    AllowedSoftware = @(
+        "Google Chrome",
+        "Firefox"
+    )
+}
+# ============================================================================
+
+$PROHIBITED_APPS = @(
+    # Hacking Tools
+    "CCleaner", "CCleaner64", "Wireshark", "Hashcat", "Ophcrack", "NMap", "John the Ripper",
+    "TeamViewer", "Burp Suite", "Metasploit", "Angry IP Scanner", "Ettercap",
+    "Aircrack-NG", "Netsparker", "BitTorrent", "Deluge", "uTorrent",
+    
+    # Adware/Spyware
+    "Web Companion", "Honey", "Capitol One",
+    
+    # Video/Music Players
+    "iTunes", "Spotify", "Pandora", "Tidal", "TV3lPC", "Groove Music",
+    
+    # Gaming
+    "Steam", "BZFlag", "Endless Sky", ".io Games",
+    
+    # Browsers (Check README before deleting!)
+    "Chromium", "Microsoft Bing", "DuckDuckGo", "Brave", "Opera", "Vivaldi"
 )
 
-$Global:LogPath = Join-Path $PSScriptRoot "cyberpatriot-hardening.log"
+$Global:LogPath = Join-Path $PSScriptRoot "user-management.log"
 
 function Write-Log {
     param([string]$Message, [string]$Level = "INFO")
     $line = "{0:u} [{1}] {2}" -f (Get-Date), $Level, $Message
-    $line | Tee-Object -FilePath $LogPath -Append
+    Write-Host $line
+    $line | Out-File -FilePath $Global:LogPath -Append
 }
 
-function Assert-Admin {
-    $principal = New-Object Security.Principal.WindowsPrincipal([Security.Principal.WindowsIdentity]::GetCurrent())
-    if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
-        throw "Run this script from an elevated PowerShell session."
+function Get-LocalUserInfo {
+    Write-Host "`nScanning local users..." -ForegroundColor Cyan
+    
+    $users = Get-LocalUser | Select-Object Name, Enabled, PasswordRequired
+    $admins = Get-LocalGroupMember -Group "Administrators" -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Name
+    
+    $userReport = @()
+    
+    foreach ($user in $users) {
+        $isAdmin = $admins -contains "$env:COMPUTERNAME\$($user.Name)"
+        
+        $userReport += [PSCustomObject]@{
+            Username = $user.Name
+            Enabled = $user.Enabled
+            IsAdmin = $isAdmin
+            PasswordRequired = $user.PasswordRequired
+            Status = "Unknown"
+        }
+    }
+    
+    return $userReport
+}
+
+function Compare-WithReadme {
+    param($CurrentUsers)
+    
+    $allRequiredUsers = $README_REQUIREMENTS.RequiredAdmins + $README_REQUIREMENTS.RequiredUsers
+    $issues = @()
+    
+    Write-Host "`n" -NoNewline
+    Write-Host "=" * 80 -ForegroundColor Cyan
+    Write-Host "USER ACCOUNT AUDIT RESULTS" -ForegroundColor Cyan
+    Write-Host "=" * 80 -ForegroundColor Cyan
+    
+    # Check each current user
+    foreach ($user in $CurrentUsers) {
+        $username = $user.Username
+        $shouldBeAdmin = $README_REQUIREMENTS.RequiredAdmins -contains $username
+        $shouldBeUser = $README_REQUIREMENTS.RequiredUsers -contains $username
+        $shouldExist = $allRequiredUsers -contains $username
+        
+        if (-not $shouldExist) {
+            $user.Status = "UNAUTHORIZED - Should be deleted"
+            $issues += [PSCustomObject]@{
+                Username = $username
+                Issue = "Unauthorized user (not in README)"
+                Action = "DELETE"
+                Priority = "HIGH"
+            }
+            Write-Host "[!] " -ForegroundColor Red -NoNewline
+            Write-Host "$username - UNAUTHORIZED USER (should be deleted)" -ForegroundColor Red
+        }
+        elseif ($shouldBeAdmin -and -not $user.IsAdmin) {
+            $user.Status = "WRONG GROUP - Should be Admin"
+            $issues += [PSCustomObject]@{
+                Username = $username
+                Issue = "Should be Administrator but is only a User"
+                Action = "ADD to Administrators"
+                Priority = "HIGH"
+            }
+            Write-Host "[!] " -ForegroundColor Yellow -NoNewline
+            Write-Host "$username - Should be ADMIN but isn't" -ForegroundColor Yellow
+        }
+        elseif ($shouldBeUser -and $user.IsAdmin) {
+            $user.Status = "WRONG GROUP - Should NOT be Admin"
+            $issues += [PSCustomObject]@{
+                Username = $username
+                Issue = "Is Administrator but should only be a User"
+                Action = "REMOVE from Administrators"
+                Priority = "HIGH"
+            }
+            Write-Host "[!] " -ForegroundColor Yellow -NoNewline
+            Write-Host "$username - Should NOT be ADMIN but is" -ForegroundColor Yellow
+        }
+        else {
+            $user.Status = "CORRECT GROUP"
+            Write-Host "[OK] " -ForegroundColor Green -NoNewline
+            Write-Host "$username - Correct permissions" -ForegroundColor Green
+        }
+        
+        if (-not $user.PasswordRequired) {
+            $issues += [PSCustomObject]@{
+                Username = $username
+                Issue = "No password required"
+                Action = "SET password"
+                Priority = "CRITICAL"
+            }
+            Write-Host "     └─> " -ForegroundColor Red -NoNewline
+            Write-Host "NO PASSWORD REQUIRED!" -ForegroundColor Red
+        }
+    }
+    
+    # Check for missing users
+    foreach ($requiredUser in $allRequiredUsers) {
+        if ($CurrentUsers.Username -notcontains $requiredUser) {
+            $shouldBeAdmin = $README_REQUIREMENTS.RequiredAdmins -contains $requiredUser
+            $issues += [PSCustomObject]@{
+                Username = $requiredUser
+                Issue = "Required user missing"
+                Action = "CREATE as " + $(if($shouldBeAdmin){"Administrator"}else{"User"})
+                Priority = "HIGH"
+            }
+            Write-Host "[!] " -ForegroundColor Red -NoNewline
+            Write-Host "$requiredUser - MISSING (should exist)" -ForegroundColor Red
+        }
+    }
+    
+    Write-Host "`n" -NoNewline
+    Write-Host "=" * 80 -ForegroundColor Cyan
+    Write-Host "TOTAL ISSUES FOUND: $($issues.Count)" -ForegroundColor $(if($issues.Count -gt 0){"Red"}else{"Green"})
+    Write-Host "=" * 80 -ForegroundColor Cyan
+    
+    return $issues
+}
+
+function Show-IssueMenu {
+    param($Issues)
+    
+    if ($Issues.Count -eq 0) {
+        Write-Host "`n[✓] No issues found! All users are configured correctly." -ForegroundColor Green
+        return
+    }
+    
+    Write-Host "`n"
+    Write-Host "ISSUES TO FIX:" -ForegroundColor Yellow
+    Write-Host "─" * 80 -ForegroundColor Yellow
+    
+    for ($i = 0; $i -lt $Issues.Count; $i++) {
+        $issue = $Issues[$i]
+        $color = switch($issue.Priority) {
+            "CRITICAL" { "Red" }
+            "HIGH" { "Yellow" }
+            default { "White" }
+        }
+        
+        Write-Host "$($i + 1). " -NoNewline -ForegroundColor $color
+        Write-Host "[$($issue.Priority)] " -NoNewline -ForegroundColor $color
+        Write-Host "$($issue.Username) - $($issue.Issue)" -ForegroundColor White
+        Write-Host "   Action: $($issue.Action)" -ForegroundColor Gray
     }
 }
 
-function Set-ExplorerHiddenItems {
-    Write-Log "Showing hidden files and protected OS files in File Explorer."
+function Remove-UnauthorizedUser {
+    param([string]$Username)
+    
+    Write-Log "Removing unauthorized user: $Username" "WARN"
+    try {
+        Remove-LocalUser -Name $Username -ErrorAction Stop
+        Write-Host "[✓] Deleted user: $Username" -ForegroundColor Green
+        return $true
+    } catch {
+        Write-Host "[✗] Failed to delete $Username`: $_" -ForegroundColor Red
+        Write-Log "Failed to delete $Username`: $_" "ERROR"
+        return $false
+    }
+}
+
+function Add-UserToAdministrators {
+    param([string]$Username)
+    
+    Write-Log "Adding $Username to Administrators group"
+    try {
+        Add-LocalGroupMember -Group "Administrators" -Member $Username -ErrorAction Stop
+        Write-Host "[✓] Added $Username to Administrators" -ForegroundColor Green
+        return $true
+    } catch {
+        Write-Host "[✗] Failed to add $Username to Administrators: $_" -ForegroundColor Red
+        Write-Log "Failed to add $Username to Administrators: $_" "ERROR"
+        return $false
+    }
+}
+
+function Remove-UserFromAdministrators {
+    param([string]$Username)
+    
+    Write-Log "Removing $Username from Administrators group"
+    try {
+        Remove-LocalGroupMember -Group "Administrators" -Member $Username -ErrorAction Stop
+        Write-Host "[✓] Removed $Username from Administrators" -ForegroundColor Green
+        return $true
+    } catch {
+        Write-Host "[✗] Failed to remove $Username from Administrators: $_" -ForegroundColor Red
+        Write-Log "Failed to remove $Username from Administrators: $_" "ERROR"
+        return $false
+    }
+}
+
+function Set-UserPasswordRequired {
+    param([string]$Username, [string]$Password)
+    
+    Write-Log "Setting password for: $Username"
+    try {
+        $securePassword = ConvertTo-SecureString $Password -AsPlainText -Force
+        Set-LocalUser -Name $Username -Password $securePassword -PasswordNeverExpires $false -UserMayChangePassword $true -ErrorAction Stop
+        Write-Host "[✓] Password set for $Username" -ForegroundColor Green
+        return $true
+    } catch {
+        Write-Host "[✗] Failed to set password for $Username`: $_" -ForegroundColor Red
+        Write-Log "Failed to set password for $Username`: $_" "ERROR"
+        return $false
+    }
+}
+
+function New-RequiredUser {
+    param([string]$Username, [bool]$IsAdmin, [string]$Password)
+    
+    Write-Log "Creating user: $Username (Admin: $IsAdmin)"
+    try {
+        $securePassword = ConvertTo-SecureString $Password -AsPlainText -Force
+        New-LocalUser -Name $Username -Password $securePassword -PasswordNeverExpires $false -UserMayChangePassword $true -ErrorAction Stop | Out-Null
+        
+        if ($IsAdmin) {
+            Add-LocalGroupMember -Group "Administrators" -Member $Username -ErrorAction Stop
+        }
+        
+        Write-Host "[✓] Created user: $Username" -ForegroundColor Green
+        return $true
+    } catch {
+        Write-Host "[✗] Failed to create $Username`: $_" -ForegroundColor Red
+        Write-Log "Failed to create $Username`: $_" "ERROR"
+        return $false
+    }
+}
+
+function Get-InstalledSoftware {
+    Write-Host "Scanning registry for installed software..." -ForegroundColor Cyan
+    $paths = @(
+        "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall",
+        "HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall",
+        "HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall"
+    )
+    
+    $software = @()
+    foreach ($path in $paths) {
+        if (Test-Path $path) {
+            Get-ChildItem $path -ErrorAction SilentlyContinue | ForEach-Object {
+                $props = Get-ItemProperty $_.PSPath -ErrorAction SilentlyContinue
+                if ($props.DisplayName) {
+                    $software += $props
+                }
+            }
+        }
+    }
+    return $software
+}
+
+function Scan-And-Remove-Software {
+    Write-Host "`n" -NoNewline
+    Write-Host "=" * 80 -ForegroundColor Magenta
+    Write-Host "SOFTWARE AUDIT" -ForegroundColor Magenta
+    Write-Host "=" * 80 -ForegroundColor Magenta
+    
+    $installed = Get-InstalledSoftware
+    $foundIssues = @()
+    
+    foreach ($app in $installed) {
+        $appName = $app.DisplayName
+        if (-not $appName) { continue }
+        
+        foreach ($badApp in $PROHIBITED_APPS) {
+            # More flexible matching - check if prohibited app name appears anywhere in the display name
+            if ($appName -match [regex]::Escape($badApp)) {
+                # Check if allowed
+                $isAllowed = $false
+                foreach ($allowed in $README_REQUIREMENTS.AllowedSoftware) {
+                    if ($appName -match [regex]::Escape($allowed)) {
+                        $isAllowed = $true
+                        break
+                    }
+                }
+                
+                if (-not $isAllowed) {
+                    $foundIssues += $app
+                    break  # Don't check other prohibited apps for this installation
+                }
+            }
+        }
+    }
+    
+    # Remove duplicates based on DisplayName
+    $uniqueIssues = $foundIssues | Sort-Object DisplayName -Unique
+    
+    if ($uniqueIssues.Count -eq 0) {
+        Write-Host "[✓] No prohibited software found." -ForegroundColor Green
+        return
+    }
+    
+    Write-Host "`nFOUND PROHIBITED SOFTWARE:" -ForegroundColor Yellow
+    foreach ($item in $uniqueIssues) {
+        Write-Host "`nFound: " -NoNewline
+        Write-Host "$($item.DisplayName)" -ForegroundColor Red
+        
+        $prompt = Read-Host "Do you want to uninstall this application? (Y/N)"
+        if ($prompt -eq "Y" -or $prompt -eq "y") {
+            Write-Host "Attempting to uninstall $($item.DisplayName)..." -ForegroundColor Cyan
+            
+            $cmd = $null
+            if ($item.QuietUninstallString) {
+                $cmd = $item.QuietUninstallString
+            } elseif ($item.UninstallString) {
+                $cmd = $item.UninstallString
+            }
+            
+            if ($cmd) {
+                try {
+                    # Handle MsiExec explicitly for better reliability
+                    if ($cmd -match "msiexec") {
+                        # Replace /I with /X for uninstall if present
+                        $args = $cmd -replace "msiexec.exe","" -replace "msiexec","" -replace "/I", "/X" -replace "/i", "/x"
+                        $args = $args.Trim()
+                        Start-Process "msiexec.exe" -ArgumentList "$args /qn" -Wait
+                    } else {
+                        # Generic command execution
+                        # Try to run it directly if it's an exe, otherwise use cmd
+                        if ($cmd -match '^"?.*?\.exe"?') {
+                            # It looks like a direct path to an exe
+                            $exe = $matches[0].Trim('"')
+                            $args = $cmd.Substring($matches[0].Length).Trim()
+                            Start-Process $exe -ArgumentList $args -Wait
+                        } else {
+                            Start-Process cmd -ArgumentList "/c $cmd" -Wait
+                        }
+                    }
+                    Write-Host "[✓] Uninstall command executed." -ForegroundColor Green
+                } catch {
+                    Write-Host "[✗] Failed to execute uninstall: $_" -ForegroundColor Red
+                }
+            } else {
+                Write-Host "[!] No uninstall string found. Please remove manually via Control Panel." -ForegroundColor Red
+            }
+        } else {
+            Write-Host "Skipped." -ForegroundColor Gray
+        }
+    }
+}
+
+function Invoke-AutoFix {
+    param($Issues)
+    
+    Write-Host "`n" -NoNewline
+    Write-Host "=" * 80 -ForegroundColor Yellow
+    Write-Host "AUTO-FIX MODE" -ForegroundColor Yellow
+    Write-Host "=" * 80 -ForegroundColor Yellow
+    Write-Host "This will automatically fix all issues. Continue? (Y/N): " -NoNewline -ForegroundColor Yellow
+    $confirm = Read-Host
+    
+    if ($confirm -ne "Y" -and $confirm -ne "y") {
+        Write-Host "Auto-fix cancelled." -ForegroundColor Gray
+        return
+    }
+    
+    $fixed = 0
+    $failed = 0
+    
+    foreach ($issue in $Issues) {
+        Write-Host "`nProcessing: $($issue.Username) - $($issue.Action)" -ForegroundColor Cyan
+        
+        $success = $false
+        
+        switch -Regex ($issue.Action) {
+            "^DELETE" {
+                $success = Remove-UnauthorizedUser -Username $issue.Username
+            }
+            "^ADD to Administrators" {
+                $success = Add-UserToAdministrators -Username $issue.Username
+            }
+            "^REMOVE from Administrators" {
+                $success = Remove-UserFromAdministrators -Username $issue.Username
+            }
+            "^SET password" {
+                if ($README_REQUIREMENTS.EnforcePasswords) {
+                    $success = Set-UserPasswordRequired -Username $issue.Username -Password $README_REQUIREMENTS.DefaultPassword
+                } else {
+                    Write-Host "[!] Skipping password set (EnforcePasswords = `$false)" -ForegroundColor Yellow
+                    Write-Host "    Manually set password for: $($issue.Username)" -ForegroundColor Yellow
+                    $success = $true
+                }
+            }
+            "^CREATE" {
+                $isAdmin = $issue.Action -match "Administrator"
+                $success = New-RequiredUser -Username $issue.Username -IsAdmin $isAdmin -Password $README_REQUIREMENTS.DefaultPassword
+            }
+        }
+        
+        if ($success) { $fixed++ } else { $failed++ }
+    }
+    
+    Write-Host "`n" -NoNewline
+    Write-Host "=" * 80 -ForegroundColor Cyan
+    Write-Host "AUTO-FIX COMPLETE" -ForegroundColor Cyan
+    Write-Host "Fixed: $fixed | Failed: $failed" -ForegroundColor $(if($failed -gt 0){"Yellow"}else{"Green"})
+    Write-Host "=" * 80 -ForegroundColor Cyan
+}
+
+# ============================================================================
+# SYSTEM HARDENING FUNCTIONS
+# ============================================================================
+
+function Set-ExplorerSettings {
+    Write-Log "Configuring File Explorer to show hidden files"
     $path = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced'
     Set-ItemProperty -Path $path -Name Hidden -Value 1 -Force
     Set-ItemProperty -Path $path -Name ShowSuperHidden -Value 1 -Force
     Set-ItemProperty -Path $path -Name HideFileExt -Value 0 -Force
+    Write-Host "[✓] File Explorer configured" -ForegroundColor Green
 }
 
-function Enable-FirewallProfiles {
-    Write-Log "Enabling firewall for all profiles."
+function Enable-FirewallAll {
+    Write-Log "Enabling Windows Firewall for all profiles"
     Set-NetFirewallProfile -Profile Domain,Private,Public -Enabled True
+    Write-Host "[✓] Firewall enabled" -ForegroundColor Green
 }
 
-
-function Invoke-DefenderScan {
-    if ($SkipDefenderScan) {
-        Write-Log "Skipping Defender scan per parameter." "WARN"
-        return
-    }
-    Write-Log "Starting Microsoft Defender quick scan."
-    Start-MpScan -ScanType QuickScan | Out-Null
-}
-
-function Apply-PasswordPolicy {
-    Write-Log "Applying password policy via net accounts and secedit."
+function Apply-PasswordPolicies {
+    Write-Log "Applying password policies"
     net accounts /maxpwage:90 /minpwage:15 /uniquepw:7 | Out-Null
     reg add "HKLM\SYSTEM\CurrentControlSet\Control\SAM" /v RelaxMinimumPasswordLengthLimits /t REG_DWORD /d 0 /f | Out-Null
-
+    
     $tempCfg = Join-Path $env:TEMP "cp-pwd.inf"
     secedit /export /cfg $tempCfg | Out-Null
     $cfg = Get-Content $tempCfg -Raw
     if ($cfg -notmatch '\[System Access\]') { $cfg += "`r`n[System Access]`r`n" }
-
+    
     $cfg = $cfg -replace 'MinimumPasswordAge\s*=.*', 'MinimumPasswordAge = 15'
     $cfg = $cfg -replace 'MaximumPasswordAge\s*=.*', 'MaximumPasswordAge = 90'
     $cfg = $cfg -replace 'PasswordHistorySize\s*=.*', 'PasswordHistorySize = 7'
@@ -61,51 +505,59 @@ function Apply-PasswordPolicy {
     $cfg = $cfg -replace 'LockoutBadCount\s*=.*', 'LockoutBadCount = 5'
     $cfg = $cfg -replace 'ResetLockoutCount\s*=.*', 'ResetLockoutCount = 30'
     $cfg = $cfg -replace 'LockoutDuration\s*=.*', 'LockoutDuration = 30'
-
+    
     $cfg | Set-Content $tempCfg -Encoding Unicode
     secedit /configure /db secedit.sdb /cfg $tempCfg /overwrite | Out-Null
     Remove-Item $tempCfg -ErrorAction SilentlyContinue
+    Write-Host "[✓] Password policies applied" -ForegroundColor Green
 }
 
-function Apply-AuditPolicies {
-    Write-Log "Enabling success/failure auditing for all categories."
+function Enable-AuditPolicies {
+    Write-Log "Enabling audit policies"
     auditpol /set /category:* /success:enable /failure:enable | Out-Null
+    Write-Host "[✓] Audit policies enabled" -ForegroundColor Green
 }
 
-function Enforce-ServiceConfiguration {
-    Write-Log "Aligning critical service states."
-
-    $rdpStartup = "Disabled"
-    $rdpState   = "Stopped"
-    if ($EnableRdp) {
-        $rdpStartup = "Manual"
-        $rdpState   = "Running"
-    }
-
-    $serviceMatrix = @(
-        @{Name="RemoteRegistry";       Startup="Disabled";  State="Stopped"},
-        @{Name="SNMPTRAP";             Startup="Disabled";  State="Stopped"},
-        @{Name="FTPSVC";               Startup="Disabled";  State="Stopped"},
-        @{Name="W3SVC";                Startup="Disabled";  State="Stopped"},
-        @{Name="TlntSvr";              Startup="Disabled";  State="Stopped"},
-        @{Name="upnphost";             Startup="Disabled";  State="Stopped"},
-        @{Name="RemoteAccess";         Startup="Disabled";  State="Stopped"},
-        @{Name="TermService";          Startup=$rdpStartup; State=$rdpState},
-        @{Name="Wecsvc";               Startup="Automatic"; State="Running"},
-        @{Name="EventLog";             Startup="Automatic"; State="Running"},
-        @{Name="wscsvc";               Startup="Automatic"; State="Running"},
-        @{Name="SamSs";                Startup="Automatic"; State="Running"},
-        @{Name="ProfSvc";              Startup="Automatic"; State="Running"},
-        @{Name="Search";               Startup="Automatic"; State="Running"},
-        @{Name="SecurityHealthService";Startup="Manual";    State="Running"},
-        @{Name="wuauserv";             Startup="Automatic"; State="Running"},
-        @{Name="bthserv";              Startup="Disabled";  State="Stopped"},
-        @{Name="XblAuthManager";       Startup="Disabled";  State="Stopped"},
-        @{Name="XblGameSave";          Startup="Disabled";  State="Stopped"},
-        @{Name="XboxNetApiSvc";        Startup="Disabled";  State="Stopped"}
+function Configure-Services {
+    param(
+        [bool]$EnableRdp = $false,
+        [bool]$EnableUpdates = $true
     )
-
-    foreach ($svc in $serviceMatrix) {
+    
+    Write-Log "Configuring Windows services"
+    
+    $rdpStartup = if ($EnableRdp) { "Manual" } else { "Disabled" }
+    $rdpState = if ($EnableRdp) { "Running" } else { "Stopped" }
+    $updateStartup = if ($EnableUpdates) { "Automatic" } else { "Disabled" }
+    $updateState = if ($EnableUpdates) { "Running" } else { "Stopped" }
+    
+    $services = @(
+        @{Name="RemoteRegistry"; Startup="Disabled"; State="Stopped"},
+        @{Name="SNMPTRAP"; Startup="Disabled"; State="Stopped"},
+        @{Name="FTPSVC"; Startup="Disabled"; State="Stopped"},
+        @{Name="W3SVC"; Startup="Disabled"; State="Stopped"},
+        @{Name="TlntSvr"; Startup="Disabled"; State="Stopped"},
+        @{Name="upnphost"; Startup="Disabled"; State="Stopped"},
+        @{Name="bthserv"; Startup="Disabled"; State="Stopped"},
+        @{Name="XblAuthManager"; Startup="Disabled"; State="Stopped"},
+        @{Name="XblGameSave"; Startup="Disabled"; State="Stopped"},
+        @{Name="XboxNetApiSvc"; Startup="Disabled"; State="Stopped"},
+        @{Name="XboxGipSvc"; Startup="Disabled"; State="Stopped"},
+        @{Name="RemoteAccess"; Startup="Disabled"; State="Stopped"},
+        @{Name="TermService"; Startup=$rdpStartup; State=$rdpState},
+        @{Name="SessionEnv"; Startup=$rdpStartup; State=$rdpState},
+        @{Name="UmRdpService"; Startup=$rdpStartup; State=$rdpState},
+        @{Name="wuauserv"; Startup=$updateStartup; State=$updateState},
+        @{Name="EventLog"; Startup="Automatic"; State="Running"},
+        @{Name="wscsvc"; Startup="Automatic"; State="Running"},
+        @{Name="Wecsvc"; Startup="Automatic"; State="Running"},
+        @{Name="SamSs"; Startup="Automatic"; State="Running"},
+        @{Name="ProfSvc"; Startup="Automatic"; State="Running"},
+        @{Name="WSearch"; Startup="Automatic"; State="Running"},
+        @{Name="SecurityHealthService"; Startup="Manual"; State="Running"}
+    )
+    
+    foreach ($svc in $services) {
         try {
             Set-Service -Name $svc.Name -StartupType $svc.Startup -ErrorAction Stop
             if ($svc.State -eq "Running") {
@@ -113,113 +565,95 @@ function Enforce-ServiceConfiguration {
             } elseif ($svc.State -eq "Stopped") {
                 Stop-Service -Name $svc.Name -Force -ErrorAction Stop
             }
+            Write-Host "[✓] Configured service: $($svc.Name)" -ForegroundColor Green
         } catch {
-            Write-Log "Service $($svc.Name) missing or cannot be modified: $_" "WARN"
+            Write-Host "[!] Service $($svc.Name) not found or cannot modify" -ForegroundColor Yellow
         }
     }
-}
-
-function Harden-RemoteDesktop {
-    $denyValue = if ($EnableRdp) { 0 } else { 1 }
-    Write-Log "Configuring Remote Desktop and Remote Assistance (EnableRdp = $EnableRdp)."
-    Set-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server" -Name fDenyTSConnections -Value $denyValue -Force
-    Set-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server" -Name fAllowToGetHelp -Value 0 -Force
-    Set-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp" -Name UserAuthentication -Value 1 -Force
-    Set-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp" -Name SecurityLayer -Value 2 -Force
-    Set-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp" -Name MinEncryptionLevel -Value 3 -Force
 }
 
 function Disable-AutoPlay {
-    Write-Log "Disabling AutoPlay/AutoRun for all drives."
-    New-Item -Path "HKCU:\Software\Microsoft\Windows\CurrentVersion\Policies" -Name Explorer -Force | Out-Null
+    Write-Log "Disabling AutoPlay"
+    New-Item -Path "HKCU:\Software\Microsoft\Windows\CurrentVersion\Policies\Explorer" -Force | Out-Null
     Set-ItemProperty -Path "HKCU:\Software\Microsoft\Windows\CurrentVersion\Policies\Explorer" -Name NoDriveTypeAutoRun -Value 255 -Force
     Set-ItemProperty -Path "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\AutoplayHandlers" -Name DisableAutoplay -Value 1 -Force
+    Write-Host "[✓] AutoPlay disabled" -ForegroundColor Green
 }
 
-function Enable-WindowsSecurityRecommendations {
-    Write-Log "Applying baseline Microsoft Defender preferences."
-    Set-MpPreference -DisableRealtimeMonitoring $false `
-        -PUAProtection Enabled `
-        -MAPSReporting Advanced `
-        -SubmitSamplesConsent SendSafeSamples `
-        -DisableIOAVProtection $false `
-        -SignatureScheduleDay Everyday `
-        -SignatureScheduleTime 120
-    Set-ProcessMitigation -System -Enable DEP,CFG | Out-Null
+function Configure-Bluetooth {
+    Write-Log "Configuring Bluetooth settings"
     try {
-        Set-MpPreference -DisableIntrusionPreventionSystem $false -ErrorAction Stop
-    } catch {
-        Write-Log "Couldn't update advanced Defender preferences: $_" "WARN"
-    }
-}
-
-function Disable-BluetoothStack {
-    Write-Log "Disabling Bluetooth radios and discoverability."
-    Stop-Service -Name bthserv -Force -ErrorAction SilentlyContinue
-    Set-Service -Name bthserv -StartupType Disabled -ErrorAction SilentlyContinue
-    try {
-        $btKey = "HKLM:\SYSTEM\CurrentControlSet\Services\BTHPORT\Parameters\General"
-        if (-not (Test-Path $btKey)) {
-            New-Item -Path $btKey -Force | Out-Null
+        Stop-Service -Name bthserv -Force -ErrorAction Stop
+        Set-Service -Name bthserv -StartupType Disabled -ErrorAction Stop
+        # Registry settings for Bluetooth discoverability
+        $btKey = "HKLM:\SYSTEM\CurrentControlSet\Services\BTHPORT\Parameters"
+        if (Test-Path $btKey) {
+            Set-ItemProperty -Path $btKey -Name "Discoverable" -Value 0 -Force -ErrorAction SilentlyContinue
         }
-        Set-ItemProperty -Path $btKey -Name EnableOffload -Value 0 -Force
+        Write-Host "[✓] Bluetooth disabled and configured" -ForegroundColor Green
     } catch {
-        Write-Log "Bluetooth registry tweak skipped: $_" "WARN"
+        Write-Host "[!] Bluetooth configuration skipped: $_" -ForegroundColor Yellow
     }
 }
 
-function Configure-NetworkSecurity {
-    Write-Log "Hardening IPv6 and anonymous access settings."
-    New-Item -Path "HKLM:\SYSTEM\CurrentControlSet\Services\Tcpip6\Parameters" -Force | Out-Null
-    Set-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Services\Tcpip6\Parameters" -Name DisabledComponents -Value 255 -Force
-    reg add "HKLM\SYSTEM\CurrentControlSet\Control\Lsa" /v LimitBlankPasswordUse /t REG_DWORD /d 1 /f | Out-Null
-    reg add "HKLM\SYSTEM\CurrentControlSet\Control\Lsa" /v NoLMHash /t REG_DWORD /d 1 /f | Out-Null
-    reg add "HKLM\SYSTEM\CurrentControlSet\Control\Lsa" /v RestrictAnonymous /t REG_DWORD /d 1 /f | Out-Null
-    reg add "HKLM\SYSTEM\CurrentControlSet\Control\Lsa" /v RestrictAnonymousSAM /t REG_DWORD /d 1 /f | Out-Null
+function Remove-MediaFiles {
+    Write-Log "Removing unauthorized media files"
+    $musicFolder = [Environment]::GetFolderPath("MyMusic")
+    if (Test-Path $musicFolder) {
+        $mediaFiles = Get-ChildItem -Path $musicFolder -Include *.mp3,*.mp4,*.mov -Recurse -ErrorAction SilentlyContinue
+        foreach ($file in $mediaFiles) {
+            try {
+                Remove-Item -Path $file.FullName -Force
+                Write-Host "[✓] Deleted: $($file.Name)" -ForegroundColor Green
+            } catch {
+                Write-Host "[!] Failed to delete: $($file.Name)" -ForegroundColor Yellow
+            }
+        }
+    }
+    Write-Host "[✓] Media file scan complete" -ForegroundColor Green
 }
 
-function Remove-UnapprovedShares {
-    if ($SkipShareCleanup) {
-        Write-Log "Skipping share cleanup per parameter." "WARN"
-        return
+function Configure-WindowsSecurity {
+    Write-Log "Configuring Windows Security settings"
+    try {
+        # Enable Windows Defender features
+        Set-MpPreference -DisableRealtimeMonitoring $false -ErrorAction Stop
+        Set-MpPreference -PUAProtection Enabled -ErrorAction Stop
+        # Memory Integrity / Core Isolation
+        reg add "HKLM\SYSTEM\CurrentControlSet\Control\DeviceGuard\Scenarios\HypervisorEnforcedCodeIntegrity" /v Enabled /t REG_DWORD /d 1 /f | Out-Null
+        # Exploit Protection - Force ASLR
+        Set-ProcessMitigation -System -Enable ForceRelocateImages -ErrorAction Stop
+        Write-Host "[✓] Windows Security configured" -ForegroundColor Green
+    } catch {
+        Write-Host "[!] Some Windows Security settings could not be applied: $_" -ForegroundColor Yellow
     }
-    Write-Log "Removing non-standard SMB shares."
-    $allowedShares = @("ADMIN$","C$","IPC$")
+}
+
+function Remove-UnauthorizedShares {
+    Write-Log "Removing unauthorized network shares"
+    $allowedShares = @("ADMIN$", "C$", "IPC$")
     try {
         $shares = Get-SmbShare | Where-Object { $_.Name -notin $allowedShares }
         foreach ($share in $shares) {
-            Remove-SmbShare -Name $share.Name -Force
-            Write-Log "Removed share $($share.Name)."
+            Remove-SmbShare -Name $share.Name -Force -Confirm:$false
+            Write-Host "[✓] Removed share: $($share.Name)" -ForegroundColor Green
         }
     } catch {
-        Write-Log "SMB share enumeration failed (likely non-Pro SKU): $_" "WARN"
+        Write-Host "[!] Share removal skipped (may not be available on this system)" -ForegroundColor Yellow
     }
 }
 
-function Cleanup-MusicFolder {
-    $music = Join-Path $env:USERPROFILE "Music"
-    if (-not (Test-Path $music)) { return }
-    Write-Log "Deleting media files from $music."
-    Get-ChildItem -Path $music -Include *.mp3,*.mp4,*.mov -File -Recurse -ErrorAction SilentlyContinue |
-        Remove-Item -Force -ErrorAction SilentlyContinue
-}
-
-function Configure-LocalAccounts {
-    Write-Log "Disabling default Administrator/Guest accounts and blocking Microsoft accounts."
-    net user Administrator /active:no | Out-Null
-    net user Guest /active:no | Out-Null
-    reg add "HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System" /v NoConnectedUser /t REG_DWORD /d 3 /f | Out-Null
-}
-
-function Apply-UserRightsTemplate {
-    Write-Log "Applying privilege rights and key security options via secedit."
-    $infPath = Join-Path $env:TEMP "cp-security.inf"
-    $inf = @"
+function Apply-AdvancedSecurityPolicies {
+    Write-Log "Applying comprehensive security policies via secedit"
+    $infPath = Join-Path $env:TEMP "cp-full-security.inf"
+    
+    $securityInf = @"
 [Unicode]
 Unicode=yes
 [Version]
-signature="$CHICAGO$"
+signature="`$CHICAGO`$"
 Revision=1
+
 [System Access]
 MinimumPasswordAge = 15
 MaximumPasswordAge = 90
@@ -283,55 +717,294 @@ SeShutdownPrivilege = *S-1-5-32-544,*S-1-5-32-545
 SeTakeOwnershipPrivilege = *S-1-5-32-544
 
 [Registry Values]
+MACHINE\Software\Microsoft\Windows\CurrentVersion\Policies\System\EnableLUA=4,1
+MACHINE\Software\Microsoft\Windows\CurrentVersion\Policies\System\ConsentPromptBehaviorAdmin=4,2
+MACHINE\Software\Microsoft\Windows\CurrentVersion\Policies\System\ConsentPromptBehaviorUser=4,0
+MACHINE\Software\Microsoft\Windows\CurrentVersion\Policies\System\PromptOnSecureDesktop=4,1
+MACHINE\Software\Microsoft\Windows\CurrentVersion\Policies\System\FilterAdministratorToken=4,1
 MACHINE\Software\Microsoft\Windows\CurrentVersion\Policies\System\DontDisplayLastUserName=4,1
 MACHINE\Software\Microsoft\Windows\CurrentVersion\Policies\System\DisableCAD=4,0
 MACHINE\Software\Microsoft\Windows\CurrentVersion\Policies\System\InactivityTimeoutSecs=4,900
 MACHINE\Software\Microsoft\Windows\CurrentVersion\Policies\System\ScRemoveOption=4,1
-MACHINE\Software\Microsoft\Windows\CurrentVersion\Policies\System\PromptOnSecureDesktop=4,1
-MACHINE\Software\Microsoft\Windows\CurrentVersion\Policies\System\EnableLUA=4,1
-MACHINE\Software\Microsoft\Windows\CurrentVersion\Policies\System\ConsentPromptBehaviorAdmin=4,2
-MACHINE\Software\Microsoft\Windows\CurrentVersion\Policies\System\ConsentPromptBehaviorUser=4,0
-MACHINE\Software\Microsoft\Windows\CurrentVersion\Policies\System\FilterAdministratorToken=4,1
 MACHINE\System\CurrentControlSet\Control\Lsa\LimitBlankPasswordUse=4,1
-MACHINE\System\CurrentControlSet\Control\Lsa\ForceGuest=4,0
 MACHINE\System\CurrentControlSet\Control\Lsa\NoLMHash=4,1
 MACHINE\System\CurrentControlSet\Control\Lsa\DisableDomainCreds=4,1
-MACHINE\System\CurrentControlSet\Control\Lsa\UseMachineId=4,1
+MACHINE\System\CurrentControlSet\Control\Lsa\RestrictAnonymous=4,1
+MACHINE\System\CurrentControlSet\Control\Lsa\RestrictAnonymousSAM=4,1
+MACHINE\System\CurrentControlSet\Control\Lsa\ForceGuest=4,0
 MACHINE\System\CurrentControlSet\Control\Lsa\SCENoApplyLegacyAuditPolicy=4,1
-MACHINE\System\CurrentControlSet\Control\SecurityProviders\WDigest\UseLogonCredential=4,0
-MACHINE\System\CurrentControlSet\Control\Terminal Server\fAllowToGetHelp=4,0
-MACHINE\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp\UserAuthentication=4,1
-MACHINE\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp\SecurityLayer=4,2
+MACHINE\System\CurrentControlSet\Control\Lsa\CrashOnAuditFail=4,0
+MACHINE\System\CurrentControlSet\Control\Lsa\LmCompatibilityLevel=4,5
 "@
-    $inf | Set-Content -Path $infPath -Encoding Unicode
-    secedit /configure /db secedit.sdb /cfg $infPath /overwrite | Out-Null
+    
+    $securityInf | Set-Content -Path $infPath -Encoding Unicode
+    secedit /configure /db secedit.sdb /cfg $infPath /overwrite /quiet | Out-Null
     Remove-Item $infPath -ErrorAction SilentlyContinue
+    Write-Host "[✓] Advanced security policies applied" -ForegroundColor Green
 }
 
-function Hardening-Reminder {
-    Write-Log "Reminder: run Malwarebytes + PatchMyPC manually and adjust users per README." "WARN"
+function Disable-GuestAndAdministrator {
+    Write-Log "Disabling Guest and Administrator accounts"
+    try {
+        net user Guest /active:no 2>$null
+        net user Administrator /active:no 2>$null
+        Write-Host "[✓] Guest and Administrator accounts disabled" -ForegroundColor Green
+    } catch {
+        Write-Host "[!] Could not disable default accounts: $_" -ForegroundColor Yellow
+    }
+}
+
+function Configure-NetworkSecurity {
+    Write-Log "Configuring network security settings"
+    # Disable IPv6
+    reg add "HKLM\SYSTEM\CurrentControlSet\Services\Tcpip6\Parameters" /v DisabledComponents /t REG_DWORD /d 255 /f | Out-Null
+    # Block Microsoft accounts
+    reg add "HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System" /v NoConnectedUser /t REG_DWORD /d 3 /f | Out-Null
+    # NTLM restrictions
+    reg add "HKLM\SYSTEM\CurrentControlSet\Control\Lsa" /v LmCompatibilityLevel /t REG_DWORD /d 5 /f | Out-Null
+    reg add "HKLM\SYSTEM\CurrentControlSet\Control\Lsa" /v RestrictAnonymous /t REG_DWORD /d 1 /f | Out-Null
+    Write-Host "[✓] Network security configured" -ForegroundColor Green
+}
+
+function Download-SecurityTools {
+    Write-Log "Downloading security scanning tools"
+    $downloadPath = Join-Path $env:USERPROFILE "Desktop"
+    
+    # Download Malwarebytes
+    Write-Host "Downloading Malwarebytes..." -ForegroundColor Cyan
+    $mbamUrl = "https://www.malwarebytes.com/api/downloads/mb-windows"
+    $mbamPath = Join-Path $downloadPath "MBSetup.exe"
+    try {
+        Invoke-WebRequest -Uri $mbamUrl -OutFile $mbamPath -UseBasicParsing -ErrorAction Stop
+        Write-Host "[✓] Malwarebytes downloaded to: $mbamPath" -ForegroundColor Green
+    } catch {
+        Write-Host "[!] Failed to download Malwarebytes: $_" -ForegroundColor Yellow
+        Write-Host "    Manual download: https://www.malwarebytes.com/mwb-download" -ForegroundColor White
+    }
+    
+    # Download Patch My PC
+    Write-Host "Downloading Patch My PC..." -ForegroundColor Cyan
+    $patchUrl = "https://patchmypc.com/freeupdater/PatchMyPC.exe"
+    $patchPath = Join-Path $downloadPath "PatchMyPC.exe"
+    try {
+        Invoke-WebRequest -Uri $patchUrl -OutFile $patchPath -UseBasicParsing -ErrorAction Stop
+        Write-Host "[✓] Patch My PC downloaded to: $patchPath" -ForegroundColor Green
+    } catch {
+        Write-Host "[!] Failed to download Patch My PC: $_" -ForegroundColor Yellow
+        Write-Host "    Manual download: https://patchmypc.com/home-updater-download" -ForegroundColor White
+    }
+    
+    Write-Host "\nTools saved to Desktop. Run them manually after hardening completes." -ForegroundColor Yellow
 }
 
 function Invoke-SystemHardening {
-    Assert-Admin
-    Write-Log "----- CyberPatriot Hardening Started -----"
-    Set-ExplorerHiddenItems
-    Enable-FirewallProfiles
-    Enable-WindowsSecurityRecommendations
-    Invoke-DefenderScan
-    Apply-PasswordPolicy
-    Apply-AuditPolicies
-    Apply-UserRightsTemplate
-    Configure-LocalAccounts
+    Write-Host "`n" + ("=" * 80) -ForegroundColor Cyan
+    Write-Host "SYSTEM HARDENING CONFIGURATION" -ForegroundColor Cyan
+    Write-Host "=" * 80 -ForegroundColor Cyan
+    
+    # Prompt for RDP
+    Write-Host "`nDoes the README say Remote Desktop (RDP) should be enabled?" -ForegroundColor Yellow
+    Write-Host "(Y/N): " -NoNewline -ForegroundColor White
+    $rdpChoice = Read-Host
+    $enableRdp = ($rdpChoice -eq "Y" -or $rdpChoice -eq "y")
+    
+    # Prompt for Windows Update
+    Write-Host "`nShould Windows Update be enabled?" -ForegroundColor Yellow
+    Write-Host "(Y/N): " -NoNewline -ForegroundColor White
+    $updateChoice = Read-Host
+    $enableUpdates = ($updateChoice -eq "Y" -or $updateChoice -eq "y")
+    
+    Write-Host "`n" + ("=" * 80) -ForegroundColor Cyan
+    Write-Host "SYSTEM HARDENING IN PROGRESS" -ForegroundColor Cyan
+    Write-Host "=" * 80 -ForegroundColor Cyan
+    
+    Set-ExplorerSettings
+    Enable-FirewallAll
+    Configure-WindowsSecurity
+    Apply-PasswordPolicies
+    Enable-AuditPolicies
+    Apply-AdvancedSecurityPolicies
+    Disable-GuestAndAdministrator
+    Configure-Services -EnableRdp $enableRdp -EnableUpdates $enableUpdates
     Configure-NetworkSecurity
-    Enforce-ServiceConfiguration
-    Harden-RemoteDesktop
+    Remove-UnauthorizedShares
     Disable-AutoPlay
-    Disable-BluetoothStack
-    Remove-UnapprovedShares
-    Cleanup-MusicFolder
-    Hardening-Reminder
-    Write-Log "----- CyberPatriot Hardening Complete -----"
+    Configure-Bluetooth
+    Remove-MediaFiles
+    Download-SecurityTools
+    
+    Write-Host "`n" + ("=" * 80) -ForegroundColor Green
+    Write-Host "SYSTEM HARDENING COMPLETE" -ForegroundColor Green
+    Write-Host "=" * 80 -ForegroundColor Green
+    Write-Host "`nREMINDERS:" -ForegroundColor Yellow
+    Write-Host "- Run Windows Defender full scan" -ForegroundColor White
+    Write-Host "- Run Malwarebytes (downloaded to Desktop)" -ForegroundColor White
+    Write-Host "- Run Patch My PC (downloaded to Desktop)" -ForegroundColor White
+    Write-Host "- Configure Firefox: Block pop-ups & enable auto-updates" -ForegroundColor White
+    Write-Host "\nPress any key to return to menu..." -ForegroundColor Gray
+    $null = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown")
+    Write-Host "=" * 80 -ForegroundColor Green
+    Write-Host "`nPress any key to return to menu..." -ForegroundColor Gray
+    $null = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown")
 }
 
-Invoke-SystemHardening
+function Show-Menu {
+    param($Issues)
+    
+    Write-Host "`n"
+    Write-Host "=" * 80 -ForegroundColor Cyan
+    Write-Host "USER MANAGEMENT MENU" -ForegroundColor Cyan
+    Write-Host "=" * 80 -ForegroundColor Cyan
+    Write-Host "1. Re-scan users and check against README" -ForegroundColor White
+    Write-Host "2. Auto-fix ALL issues" -ForegroundColor Green
+    Write-Host "3. Manually fix issues one-by-one" -ForegroundColor Yellow
+    Write-Host "4. Export user report to CSV" -ForegroundColor White
+    Write-Host "5. Show what the README says (your config)" -ForegroundColor White
+    Write-Host "6. Scan and Remove Prohibited Software" -ForegroundColor Magenta
+    Write-Host "7. Run System Hardening (Policies, Services, Firewall)" -ForegroundColor Cyan
+    Write-Host "0. Exit" -ForegroundColor Red
+    Write-Host "=" * 80 -ForegroundColor Cyan
+}
+
+function Show-ReadmeConfig {
+    Write-Host "`n"
+    Write-Host "=" * 80 -ForegroundColor Cyan
+    Write-Host "YOUR README CONFIGURATION" -ForegroundColor Cyan
+    Write-Host "=" * 80 -ForegroundColor Cyan
+    
+    Write-Host "`nRequired ADMINISTRATORS:" -ForegroundColor Green
+    foreach ($admin in $README_REQUIREMENTS.RequiredAdmins) {
+        Write-Host "  • $admin" -ForegroundColor White
+    }
+    
+    Write-Host "`nRequired USERS (non-admin):" -ForegroundColor Yellow
+    foreach ($user in $README_REQUIREMENTS.RequiredUsers) {
+        Write-Host "  • $user" -ForegroundColor White
+    }
+    
+    Write-Host "`nPassword Enforcement: $($README_REQUIREMENTS.EnforcePasswords)" -ForegroundColor $(if($README_REQUIREMENTS.EnforcePasswords){"Green"}else{"Red"})
+    if ($README_REQUIREMENTS.EnforcePasswords) {
+        Write-Host "Default Password: $($README_REQUIREMENTS.DefaultPassword)" -ForegroundColor Gray
+    }
+    
+    Write-Host "`n" -NoNewline
+    Write-Host "=" * 80 -ForegroundColor Cyan
+}
+
+function Invoke-ManualFix {
+    param($Issues)
+    
+    if ($Issues.Count -eq 0) {
+        Write-Host "`n[✓] No issues to fix!" -ForegroundColor Green
+        return
+    }
+    
+    foreach ($issue in $Issues) {
+        Write-Host "`n" -NoNewline
+        Write-Host "─" * 80 -ForegroundColor Yellow
+        Write-Host "Issue: " -NoNewline -ForegroundColor White
+        Write-Host "$($issue.Username) - $($issue.Issue)" -ForegroundColor Yellow
+        Write-Host "Action needed: $($issue.Action)" -ForegroundColor Cyan
+        Write-Host "─" * 80 -ForegroundColor Yellow
+        Write-Host "Fix this issue? (Y/N/Q to quit): " -NoNewline -ForegroundColor White
+        
+        $response = Read-Host
+        
+        if ($response -eq "Q" -or $response -eq "q") {
+            Write-Host "Manual fix cancelled." -ForegroundColor Gray
+            break
+        }
+        
+        if ($response -ne "Y" -and $response -ne "y") {
+            Write-Host "Skipped." -ForegroundColor Gray
+            continue
+        }
+        
+        switch -Regex ($issue.Action) {
+            "^DELETE" {
+                Remove-UnauthorizedUser -Username $issue.Username | Out-Null
+            }
+            "^ADD to Administrators" {
+                Add-UserToAdministrators -Username $issue.Username | Out-Null
+            }
+            "^REMOVE from Administrators" {
+                Remove-UserFromAdministrators -Username $issue.Username | Out-Null
+            }
+            "^SET password" {
+                if ($README_REQUIREMENTS.EnforcePasswords) {
+                    Set-UserPasswordRequired -Username $issue.Username -Password $README_REQUIREMENTS.DefaultPassword | Out-Null
+                } else {
+                    Write-Host "Enter new password for $($issue.Username): " -NoNewline -ForegroundColor Cyan
+                    $pass = Read-Host -AsSecureString
+                    $plainPass = [Runtime.InteropServices.Marshal]::PtrToStringAuto([Runtime.InteropServices.Marshal]::SecureStringToBSTR($pass))
+                    Set-UserPasswordRequired -Username $issue.Username -Password $plainPass | Out-Null
+                }
+            }
+            "^CREATE" {
+                $isAdmin = $issue.Action -match "Administrator"
+                New-RequiredUser -Username $issue.Username -IsAdmin $isAdmin -Password $README_REQUIREMENTS.DefaultPassword | Out-Null
+            }
+        }
+    }
+}
+
+# Main execution
+Write-Host "=" * 80 -ForegroundColor Cyan
+Write-Host "CyberPatriot User Account Management Helper" -ForegroundColor Cyan
+Write-Host "=" * 80 -ForegroundColor Cyan
+
+$currentUsers = Get-LocalUserInfo
+$issues = Compare-WithReadme -CurrentUsers $currentUsers
+Show-IssueMenu -Issues $issues
+
+while ($true) {
+    Show-Menu -Issues $issues
+    $choice = Read-Host "`nEnter your choice"
+    
+    switch ($choice) {
+        "1" {
+            $currentUsers = Get-LocalUserInfo
+            $issues = Compare-WithReadme -CurrentUsers $currentUsers
+            Show-IssueMenu -Issues $issues
+        }
+        "2" {
+            Invoke-AutoFix -Issues $issues
+            Write-Host "`nPress any key to re-scan..." -ForegroundColor Gray
+            $null = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown")
+            $currentUsers = Get-LocalUserInfo
+            $issues = Compare-WithReadme -CurrentUsers $currentUsers
+            Show-IssueMenu -Issues $issues
+        }
+        "3" {
+            Invoke-ManualFix -Issues $issues
+            Write-Host "`nPress any key to re-scan..." -ForegroundColor Gray
+            $null = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown")
+            $currentUsers = Get-LocalUserInfo
+            $issues = Compare-WithReadme -CurrentUsers $currentUsers
+            Show-IssueMenu -Issues $issues
+        }
+        "4" {
+            $csvPath = Join-Path $PSScriptRoot "user-audit-report.csv"
+            $currentUsers | Export-Csv -Path $csvPath -NoTypeInformation
+            Write-Host "[✓] Report exported to: $csvPath" -ForegroundColor Green
+        }
+        "5" {
+            Show-ReadmeConfig
+        }
+        "6" {
+            Scan-And-Remove-Software
+            Write-Host "`nPress any key to continue..." -ForegroundColor Gray
+            $null = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown")
+        }
+        "7" {
+            Invoke-SystemHardening
+        }
+        "0" {
+            Write-Host "`nExiting..." -ForegroundColor Yellow
+            exit
+        }
+        default {
+            Write-Host "Invalid choice. Please try again." -ForegroundColor Red
+        }
+    }
+}
