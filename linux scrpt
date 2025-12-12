@@ -1,0 +1,423 @@
+#!/bin/bash
+set -euo pipefail
+IFS=$'\n\t'
+
+trap 'echo "[!] An unexpected error occurred on line $LINENO. Aborting." >&2' ERR
+
+export DEBIAN_FRONTEND=noninteractive
+
+NEW_SSH_PORT=""
+DISTRO_ID=""
+DISTRO_VERSION=""
+DISTRO_NAME=""
+DISTRO_LIKE=""
+MIN_MINT_MAJOR=21
+
+display_warning() {
+cat <<'EOW'
+# This script automates the Linux Mint hardening tasks from your presentation.
+# It must be run with root privileges.
+#
+# !! WARNING !!
+#
+# 1. Run this script using: sudo bash "./linux scrpt"
+# 2. This script WILL change your SSH port and disable root login.
+# 3. If you are connected via SSH, your connection WILL be dropped.
+# 4. This script also disables IPv6, which may affect network connectivity
+#    if your network relies on it.
+# 5. Make sure you have physical or console access
+#    if something goes wrong.
+#
+# Press Ctrl+C to cancel, or Enter to continue...
+EOW
+read -r
+}
+
+log_step() {
+    echo "[*] $1"
+}
+
+print_divider() {
+    echo "----------------------------------------------------"
+}
+
+warn() {
+    echo "[!] $1" >&2
+}
+
+ensure_root() {
+    if [[ $EUID -ne 0 ]]; then
+        echo "This script must be run as root (e.g., 'sudo bash $0')" >&2
+        exit 1
+    fi
+}
+
+ensure_apt_available() {
+    if ! command -v apt-get >/dev/null 2>&1; then
+        echo "This script requires apt-get, which was not found on this system." >&2
+        exit 1
+    fi
+}
+
+detect_distro() {
+    if [[ -f /etc/os-release ]]; then
+        # shellcheck disable=SC1091
+        . /etc/os-release
+        DISTRO_ID=${ID:-unknown}
+        DISTRO_VERSION=${VERSION_ID:-unknown}
+        DISTRO_NAME=${PRETTY_NAME:-$DISTRO_ID}
+        DISTRO_LIKE=${ID_LIKE:-}
+    else
+        warn "/etc/os-release not found; proceeding without distro specifics."
+    fi
+}
+
+ensure_linux_mint() {
+    if [[ "$DISTRO_ID" != "linuxmint" ]]; then
+        echo "This script is only supported on Linux Mint $MIN_MINT_MAJOR.x." >&2
+        exit 1
+    fi
+
+    local mint_major="${DISTRO_VERSION%%.*}"
+    if [[ -n "$mint_major" && "$mint_major" =~ ^[0-9]+$ ]]; then
+        if (( mint_major < MIN_MINT_MAJOR )); then
+            echo "Detected Linux Mint $DISTRO_VERSION. Please upgrade to Mint $MIN_MINT_MAJOR or newer before running this script." >&2
+            exit 1
+        fi
+    else
+        warn "Unable to parse Linux Mint version ('$DISTRO_VERSION'). Proceeding, but results may vary."
+    fi
+}
+backup_file() {
+    local target="$1"
+    if [[ -f "$target" ]]; then
+        local backup="${target}.bak.$(date +%Y%m%d%H%M%S)"
+        cp "$target" "$backup"
+        echo "    (Backup saved to $backup)"
+    fi
+}
+
+ensure_sysctl_value() {
+    local key="$1"
+    local value="$2"
+    local file="$3"
+    touch "$file"
+    if grep -q "^$key" "$file"; then
+        sed -i "s|^$key.*|$key=$value|" "$file"
+    else
+        echo "$key=$value" >> "$file"
+    fi
+}
+
+ensure_kv_pair() {
+    local key="$1"
+    local value="$2"
+    local file="$3"
+    touch "$file"
+    if grep -q "^[#[:space:]]*$key" "$file"; then
+        sed -i -E "s|^[#[:space:]]*$key.*|$key $value|" "$file"
+    else
+        echo "$key $value" >> "$file"
+    fi
+}
+
+stop_and_disable_service() {
+    local svc="$1"
+    systemctl stop "$svc" >/dev/null 2>&1 || true
+    systemctl disable "$svc" >/dev/null 2>&1 || true
+}
+
+restart_ssh_service() {
+    if systemctl list-unit-files | grep -q '^ssh\.service'; then
+        systemctl restart ssh
+    else
+        systemctl restart sshd
+    fi
+}
+
+choose_guest_conf() {
+    local candidates=(
+        /usr/share/lightdm/lightdm.conf.d/50-ubuntu.conf
+        /usr/share/lightdm/lightdm.conf.d/90-linuxmint.conf
+        /etc/lightdm/lightdm.conf.d/50-ubuntu.conf
+        /etc/lightdm/lightdm.conf.d/90-linuxmint.conf
+        /etc/lightdm/lightdm.conf.d/50-no-guest.conf
+    )
+    for candidate in "${candidates[@]}"; do
+        if [[ -f "$candidate" ]]; then
+            echo "$candidate"
+            return
+        fi
+    done
+    local fallback="/etc/lightdm/lightdm.conf.d/50-no-guest.conf"
+    mkdir -p "$(dirname "$fallback")"
+    touch "$fallback"
+    echo "$fallback"
+}
+prompt_for_ssh_port() {
+    local input=""
+    while true; do
+        read -r -p "    Please enter a new SSH port (blank to skip): " input
+        if [[ -z "$input" ]]; then
+            NEW_SSH_PORT=""
+            return 1
+        elif [[ "$input" =~ ^[0-9]+$ ]] && (( input >= 1024 && input <= 65535 )); then
+            NEW_SSH_PORT="$input"
+            return 0
+        else
+            echo "    !! Invalid port. Enter a number between 1024 and 65535."
+        fi
+    done
+}
+
+update_system() {
+    log_step "1. Updating package lists and upgrading system..."
+    apt-get update
+    apt-get upgrade -y
+    log_step "   System update complete."
+    print_divider
+}
+
+configure_auto_updates() {
+    log_step "2. Configuring automatic security updates..."
+    local conf="/etc/apt/apt.conf.d/20auto-upgrades"
+    backup_file "$conf"
+    cat <<'EOL' > "$conf"
+APT::Periodic::Update-Package-Lists "1";
+APT::Periodic::Download-Upgradeable-Packages "1";
+APT::Periodic::AutocleanInterval "7";
+APT::Periodic::Unattended-Upgrade "1";
+EOL
+    log_step "   Automatic updates configured."
+    print_divider
+}
+
+configure_ufw() {
+    log_step "3. Installing and configuring UFW (Firewall)..."
+    apt-get install -y ufw
+    ufw allow ssh >/dev/null 2>&1 || true
+    ufw --force enable
+    log_step "   UFW installed, SSH allowed, and firewall enabled."
+    print_divider
+}
+
+stop_unnecessary_services() {
+    log_step "4. Stopping and disabling Nginx, Yelp, and Apache..."
+    stop_and_disable_service "nginx"
+    stop_and_disable_service "yelp.service"
+    stop_and_disable_service "apache2"
+    log_step "   Services stopped and disabled (ignored if not present)."
+    print_divider
+}
+
+secure_sshd() {
+    log_step "5. Securing SSH configuration (/etc/ssh/sshd_config)..."
+    local ssh_config="/etc/ssh/sshd_config"
+    if [[ ! -f "$ssh_config" ]]; then
+        warn "sshd_config not found; skipping SSH hardening."
+        print_divider
+        return
+    fi
+
+    backup_file "$ssh_config"
+
+    if grep -q "^[#[:space:]]*PermitRootLogin" "$ssh_config"; then
+        sed -i 's|^[#[:space:]]*PermitRootLogin.*|PermitRootLogin no|' "$ssh_config"
+    else
+        echo "PermitRootLogin no" >> "$ssh_config"
+    fi
+
+    echo "    -> Changing SSH port..."
+    if prompt_for_ssh_port; then
+        if grep -q "^[#[:space:]]*Port " "$ssh_config"; then
+            sed -i "s|^[#[:space:]]*Port .*|Port $NEW_SSH_PORT|" "$ssh_config"
+        else
+            echo "Port $NEW_SSH_PORT" >> "$ssh_config"
+        fi
+        echo "    -> Allowing TCP port $NEW_SSH_PORT in UFW..."
+        ufw allow "$NEW_SSH_PORT"/tcp
+    else
+        echo "    -> Leaving SSH port unchanged."
+    fi
+
+    echo "    -> Restarting SSH service to apply changes..."
+    restart_ssh_service
+    log_step "   SSH configuration secured."
+    print_divider
+}
+
+secure_lightdm() {
+    log_step "6. Securing LightDM (Login Manager)..."
+    local lightdm_conf="/etc/lightdm/lightdm.conf"
+    if [[ ! -d /etc/lightdm && ! -d /usr/share/lightdm ]]; then
+        echo "    (Note: LightDM not detected on this system. Skipping.)"
+        print_divider
+        return
+    fi
+
+    local guest_conf="$(choose_guest_conf)"
+
+    if [[ -f "$lightdm_conf" ]]; then
+        backup_file "$lightdm_conf"
+        sed -i '/^allow-root=true/d' "$lightdm_conf"
+    else
+        echo "    (Note: $lightdm_conf not found. Skipping root login check.)"
+    fi
+
+    backup_file "$guest_conf"
+    if grep -q "^[#[:space:]]*allow-guest" "$guest_conf"; then
+        sed -i 's|^[#[:space:]]*allow-guest.*|allow-guest=false|' "$guest_conf"
+    else
+        echo "allow-guest=false" >> "$guest_conf"
+    fi
+
+    log_step "   LightDM configuration secured."
+    print_divider
+}
+
+install_fail2ban() {
+    log_step "7. Installing and enabling Fail2Ban..."
+    apt-get install -y fail2ban
+    systemctl enable --now fail2ban
+    log_step "   Fail2Ban installed and running."
+    print_divider
+}
+
+install_clamav() {
+    log_step "8. Installing ClamAV (Antivirus)..."
+    apt-get install -y clamav clamav-daemon
+    echo "    -> Updating virus definitions..."
+    systemctl stop clamav-freshclam >/dev/null 2>&1 || true
+    if ! freshclam; then
+        warn "Unable to update virus definitions right now. Try 'freshclam' later."
+    fi
+    systemctl enable --now clamav-freshclam
+    systemctl enable --now clamav-daemon
+    log_step "   ClamAV installed and services enabled."
+    print_divider
+}
+
+install_apparmor() {
+    log_step "9. Installing and enabling AppArmor..."
+    apt-get install -y apparmor-utils
+    systemctl enable --now apparmor
+    log_step "   AppArmor installed and enabled."
+    print_divider
+}
+
+enforce_password_policies() {
+    log_step "10. Enforcing strong password policies..."
+    apt-get install -y libpam-pwquality
+
+    local pwquality_conf="/etc/pam.d/common-password"
+    local pwquality_line="password requisite pam_pwquality.so retry=3 minlen=12 maxrepeat=3 ucredit=-1 lcredit=-1 dcredit=-1 ocredit=-1 difok=4 reject_username enforce_for_root"
+
+    touch "$pwquality_conf"
+    backup_file "$pwquality_conf"
+
+    if grep -q "pam_pwquality.so" "$pwquality_conf"; then
+        sed -i "s|.*pam_pwquality.so.*|$pwquality_line|" "$pwquality_conf"
+    else
+        echo "$pwquality_line" >> "$pwquality_conf"
+    fi
+
+    local login_defs="/etc/login.defs"
+    touch "$login_defs"
+    backup_file "$login_defs"
+
+    ensure_kv_pair "FAIL_LOG_ENAB" "yes" "$login_defs"
+    ensure_kv_pair "LOG_OK_LOGINS" "yes" "$login_defs"
+    ensure_kv_pair "LOG_UNKFAIL_ENAB" "yes" "$login_defs"
+    ensure_kv_pair "SYSLOG_SU_ENAB" "yes" "$login_defs"
+    ensure_kv_pair "SYSLOG_SG_ENAB" "yes" "$login_defs"
+    ensure_kv_pair "PASS_MAX_DAYS" "90" "$login_defs"
+    ensure_kv_pair "PASS_MIN_DAYS" "15" "$login_defs"
+    ensure_kv_pair "PASS_WARN_AGE" "7" "$login_defs"
+
+    log_step "   Password policies enforced."
+    print_divider
+}
+
+disable_ipv6() {
+    log_step "11. Disabling IPv6..."
+    local sysctl_conf="/etc/sysctl.conf"
+    touch "$sysctl_conf"
+    backup_file "$sysctl_conf"
+
+    if ! grep -q "# Disable IPv6 (linux_hardening)" "$sysctl_conf"; then
+        echo "" >> "$sysctl_conf"
+        echo "# Disable IPv6 (linux_hardening)" >> "$sysctl_conf"
+    fi
+
+    ensure_sysctl_value "net.ipv6.conf.all.disable_ipv6" "1" "$sysctl_conf"
+    ensure_sysctl_value "net.ipv6.conf.default.disable_ipv6" "1" "$sysctl_conf"
+    ensure_sysctl_value "net.ipv6.conf.lo.disable_ipv6" "1" "$sysctl_conf"
+
+    echo "    -> Applying sysctl changes..."
+    sysctl -p >/dev/null
+    log_step "   IPv6 disabled. A reboot may be required for full effect."
+    print_divider
+}
+
+print_manual_steps() {
+    cat <<'EOM'
+
+====================================================
+SCRIPT EXECUTION FINISHED
+====================================================
+
+--- REMINDER: MANUAL STEPS REQUIRED ---
+
+1.  **User Accounts (IMG_1235.png):**
+    Go to 'Settings > User Settings' to manually:
+    - Add/delete user accounts.
+    - Change/create passwords (they will now follow the new rules).
+    - Change accounts to 'Standard' or 'Administrative'.
+    - Verify 'auto-logon' is turned off.
+
+2.  **Screen Lock (IMG_1240.png):**
+    Go to 'Settings > Privacy > Screen Lock' to:
+    - Enable automatic screen lock.
+    - Choose an appropriate time interval.
+
+3.  **Show Hidden Files (IMG_1232.png):**
+    Open your File Manager (Nautilus, etc.) and find the
+    menu option to 'Show Hidden Files'.
+
+4.  **Run Antivirus Scan (IMG_1242.png):**
+    ClamAV is installed, but you should run scans manually.
+    Example: 'clamscan -r /home' to scan your home directory.
+EOM
+
+    if [[ -n "$NEW_SSH_PORT" ]]; then
+        echo "--- !! IMPORTANT SSH !! ---"
+        echo "Your SSH port has been changed to $NEW_SSH_PORT."
+        echo "Reconnect using: ssh <your-user>@<your-ip> -p $NEW_SSH_PORT"
+    fi
+}
+
+main() {
+    log_step "Detected distribution: ${DISTRO_NAME:-unknown} (ID: ${DISTRO_ID:-unknown}, Version: ${DISTRO_VERSION:-unknown})"
+    print_divider
+    log_step "Starting Linux hardening script..."
+    print_divider
+    update_system
+    configure_auto_updates
+    configure_ufw
+    stop_unnecessary_services
+    secure_sshd
+    secure_lightdm
+    install_fail2ban
+    install_clamav
+    install_apparmor
+    enforce_password_policies
+    disable_ipv6
+    print_manual_steps
+}
+
+display_warning
+ensure_root
+ensure_apt_available
+detect_distro
+ensure_linux_mint
+main

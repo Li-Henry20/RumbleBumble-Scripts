@@ -1,0 +1,19 @@
+Steps to run the Linux Mint 21 hardening script:
+
+1. Open a local terminal session (Ctrl+Alt+T or an on-box console). Avoid remote SSH because the script restarts SSH and changes its port.
+2. Change into the folder that contains the script file named `linux scrpt`, for example:
+   cd /path/to/RumbleBumble-Scripts
+3. (First run only) make the script executable:
+   chmod +x "linux scrpt"
+4. Execute the script with root privileges so it can apply system changes:
+   sudo bash "./linux scrpt"
+5. Read the warning banner, then press Enter to continue when you are ready.
+6. When prompted, optionally enter a new SSH port number between 1024 and 65535. Leave it blank to keep the current SSH port.
+7. Wait for the script to finish. It will install required packages, update configs, and restart services automatically.
+8. After completion, follow the manual checklist printed at the end (user accounts, screen lock, hidden files, antivirus scan).
+9. If you changed the SSH port, reconnect using:
+   ssh your-user@your-host -p <new-port>
+
+Important:
+- The script disables IPv6 and can affect remote connectivity; ensure you have console access before running it.
+- Supported platform: Linux Mint 21.x (and point releases) only.
