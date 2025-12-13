@@ -249,8 +249,8 @@ list_active_services() {
 }
 
 stop_unnecessary_services() {
-    log_step "5. Stopping and disabling common unnecessary services (Nginx, VNC, Apache, Yelp)..."
-    local services=(nginx apache2 vncserver x11vnc tigervncserver vino-server yelp.service)
+    log_step "5. Stopping and disabling common unnecessary services (VNC, Apache, Yelp)..."
+    local services=(apache2 vncserver x11vnc tigervncserver vino-server yelp.service)
     for svc in "${services[@]}"; do
         stop_and_disable_service "$svc"
     done
