@@ -11,7 +11,8 @@ Steps to run the Linux Mint 21 hardening script:
 6. When prompted, optionally enter a new SSH port number between 1024 and 65535. Leave it blank to keep the current SSH port.
 7. Wait for the script to finish. It will install required packages, update configs, and restart services automatically.
 8. After completion, follow the manual checklist printed at the end (user accounts, screen lock, hidden files, antivirus scan).
-9. If you changed the SSH port, reconnect using:
+9. Review `/var/log/clamav/manual-scan-*.log` if you kicked off the optional antivirus scan to confirm results or investigate detections.
+10. If you changed the SSH port, reconnect using:
    ssh your-user@your-host -p <new-port>
 
 Important:
